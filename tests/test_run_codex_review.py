@@ -120,7 +120,7 @@ def _calls(tmp_path: Path) -> list[dict[str, list[str]]]:
 def test_powershell_script_has_no_parse_errors() -> None:
     command = (
         "$tokens=$null; $errors=$null; "
-        "[System.Management.Automation.Language.Parser]::ParseFile(" 
+        "[System.Management.Automation.Language.Parser]::ParseFile("
         "$env:CODEX_REVIEW_SCRIPT, [ref]$tokens, [ref]$errors) | Out-Null; "
         "if ($errors.Count -gt 0) { $errors | ForEach-Object { $_.Message }; exit 1 }"
     )
