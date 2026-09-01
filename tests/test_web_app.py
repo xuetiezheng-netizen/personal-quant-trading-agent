@@ -87,6 +87,223 @@ def test_post_rejects_invalid_token(running_server: RunningServer) -> None:
     assert "令牌" in payload["error"]
 
 
+@pytest.mark.parametrize("path", ["/api/status", "/api/holdings", "/api/swing-results"])
+def test_private_get_endpoints_require_token_and_do_not_read_without_it(
+    running_server: RunningServer, path: str
+) -> None:
+    status, payload = running_server.request("GET", path, token="wrong")
+    assert status == 403
+    assert "令牌" in payload["error"]
+    assert "holdings" not in payload
+    assert "latest-results" not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_holdings_crud_persists_across_server_restart_and_rejects_stale_revision(
+    tmp_path: Path,
+) -> None:
+    first_server = RunningServer(tmp_path)
+    holding = {
+        "code": "999999",
+        "name": "虚构资产",
+        "asset_type": "etf",
+        "quantity": 100,
+        "avg_cost_cny": 10.5,
+        "tactical_ratio": 0.2,
+        "expected_revision": 0,
+    }
+    try:
+        status, created = first_server.request("POST", "/api/holdings", body=holding)
+        assert status == 201
+        assert created["revision"] == 1
+        assert created["holdings"][0]["code"] == "999999"
+
+        status, updated = first_server.request(
+            "PUT",
+            "/api/holdings/etf/999999",
+            body={"quantity": 125, "expected_revision": 1},
+        )
+        assert status == 200
+        assert updated["revision"] == 2
+        assert updated["holdings"][0]["quantity"] == 125
+    finally:
+        first_server.close()
+
+    restarted = RunningServer(tmp_path)
+    try:
+        status, loaded = restarted.request("GET", "/api/holdings")
+        assert status == 200
+        assert loaded["revision"] == 2
+        assert loaded["holdings"][0]["quantity"] == 125
+
+        status, stale = restarted.request(
+            "DELETE",
+            "/api/holdings/etf/999999",
+            body={"expected_revision": 1},
+        )
+        assert status == 409
+        assert "刷新" in stale["error"]
+
+        status, deleted = restarted.request(
+            "DELETE",
+            "/api/holdings/etf/999999",
+            body={"expected_revision": 2},
+        )
+        assert status == 200
+        assert deleted["holdings"] == []
+    finally:
+        restarted.close()
+
+
+def test_holdings_reject_unknown_fields_missing_revision_and_bad_route(
+    tmp_path: Path,
+) -> None:
+    server = RunningServer(tmp_path)
+    try:
+        base = {
+            "code": "999999",
+            "name": "虚构资产",
+            "asset_type": "etf",
+            "quantity": 100,
+            "avg_cost_cny": 10.5,
+            "unexpected": "must-not-be-stored",
+        }
+        status, _ = server.request("POST", "/api/holdings", body=base)
+        assert status == 400
+        assert not (tmp_path / "data" / "private" / "holdings.json").exists()
+
+        valid = {key: value for key, value in base.items() if key != "unexpected"}
+        valid["expected_revision"] = 0
+        status, _ = server.request("POST", "/api/holdings", body=valid)
+        assert status == 201
+        status, missing_revision = server.request(
+            "PUT", "/api/holdings/etf/999999", body={"quantity": 101}
+        )
+        assert status == 400
+        assert "expected_revision" in missing_revision["error"]
+
+        for path in (
+            "/api/holdings/etf/99999",
+            "/api/holdings/etf/999999/extra",
+            "/api/holdings/../../run_swing.py",
+        ):
+            status, _ = server.request(
+                "PUT", path, body={"quantity": 101, "expected_revision": 1}
+            )
+            assert status == 404
+    finally:
+        server.close()
+
+
+def test_swing_command_is_fixed_and_invalid_selector_never_starts_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+    (tmp_path / ".venv" / "Scripts" / "python.exe").write_bytes(b"fake")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "run_swing.py").write_text("", encoding="utf-8")
+
+    argv = web_app.command_for_swing_action(
+        "analyze", tmp_path, code="999999", asset_type="etf"
+    )
+    assert argv == [
+        str(tmp_path / ".venv" / "Scripts" / "python.exe"),
+        "-X",
+        "utf8",
+        str(tmp_path / "scripts" / "run_swing.py"),
+        "analyze",
+        "--code",
+        "999999",
+        "--asset-type",
+        "etf",
+    ]
+
+    server = RunningServer(tmp_path)
+    started = False
+
+    def fail_start(*_args: object, **_kwargs: object) -> None:
+        nonlocal started
+        started = True
+        pytest.fail("invalid swing request must not start a process")
+
+    monkeypatch.setattr(server.server.app.tasks, "start", fail_start)
+    try:
+        for payload in (
+            {"action": "../../run_swing.py"},
+            {"action": "analyze", "code": "999999;Write-Output injected", "asset_type": "etf"},
+            {"action": "analyze", "code": "999999", "asset_type": "etf", "path": "x"},
+        ):
+            status, _ = server.request("POST", "/api/swing-action", body=payload)
+            assert status == 400
+        assert started is False
+    finally:
+        server.close()
+
+
+def test_swing_task_uses_shell_false_and_one_fixed_python_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+    (tmp_path / ".venv" / "Scripts" / "python.exe").write_bytes(b"fake")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "run_swing.py").write_text("", encoding="utf-8")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def communicate(self):
+            return b"finished", None
+
+    def fake_popen(argv: list[str], **kwargs: object) -> FakeProcess:
+        calls.append((argv, kwargs))
+        return FakeProcess()
+
+    manager = web_app.TaskManager(tmp_path, popen_factory=fake_popen)
+    task = manager.start("analyze", code="999999", asset_type="etf")
+    for _ in range(30):
+        if task.status != "running":
+            break
+        time.sleep(0.01)
+    assert task.status == "succeeded"
+    assert len(calls) == 1
+    assert calls[0][1]["shell"] is False
+    assert calls[0][0][4] == "analyze"
+
+
+def test_swing_results_use_only_fixed_relative_paths_and_hide_diagnostics(
+    tmp_path: Path,
+) -> None:
+    results = tmp_path / "data" / "private"
+    reports = results / "reports"
+    reports.mkdir(parents=True)
+    report = reports / "swing-report-20260901.md"
+    report.write_text("仅虚构测试报告", encoding="utf-8")
+    absolute = str((tmp_path / "secret.txt").resolve())
+    (results / "latest-results.json").write_text(
+        json.dumps(
+            {
+                "report_path": str(report.resolve()),
+                "outside_path": absolute,
+                "traceback": "Traceback (most recent call last): secret",
+                "status": "ok",
+            }
+        ),
+        encoding="utf-8",
+    )
+    server = RunningServer(tmp_path)
+    try:
+        status, payload = server.request("GET", "/api/swing-results?path=../../secret.txt")
+        serialized = json.dumps(payload, ensure_ascii=False)
+        assert status == 200
+        assert payload["latest_results_path"] == "data/private/latest-results.json"
+        assert payload["latest_report_path"] == "data/private/reports/swing-report-20260901.md"
+        assert payload["reports"][0]["path"] == "data/private/reports/swing-report-20260901.md"
+        assert str(tmp_path.resolve()) not in serialized
+        assert "Traceback" not in serialized
+    finally:
+        server.close()
+
+
 def test_post_rejects_unknown_action(running_server: RunningServer) -> None:
     status, payload = running_server.request("POST", "/api/action", body={"action": "run-anything"})
     assert status == 400
@@ -213,6 +430,7 @@ def test_cmd_launcher_is_ascii_crlf_and_real_cmd_parses_exit_code(tmp_path: Path
 def test_results_folder_is_the_data_root_and_codex_folder_stays_separate() -> None:
     assert web_app.FOLDER_PATHS["data"] == REPO_ROOT / "data"
     assert web_app.FOLDER_PATHS["codex_reviews"] == REPO_ROOT / "data" / "codex_reviews"
+    assert web_app.FOLDER_PATHS["private_reports"] == REPO_ROOT / "data" / "private" / "reports"
     html = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
     assert 'data-folder="data"' in html
     assert "打开全部结果文件夹" in html
@@ -226,6 +444,23 @@ def test_open_data_folder_uses_fixed_data_root(monkeypatch: pytest.MonkeyPatch, 
     assert status == 200
     assert payload == {"ok": True, "folder": "data"}
     assert opened == [str((REPO_ROOT / "data").resolve())]
+
+
+def test_open_private_reports_folder_uses_fixed_private_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(web_app.os, "startfile", lambda path: opened.append(path), raising=False)
+    server = RunningServer(tmp_path)
+    try:
+        status, payload = server.request(
+            "POST", "/api/open-folder", body={"folder": "private_reports"}
+        )
+        assert status == 200
+        assert payload == {"ok": True, "folder": "private_reports"}
+        assert opened == [str((tmp_path / "data" / "private" / "reports").resolve())]
+    finally:
+        server.close()
 
 
 def test_mobile_layout_constrains_long_result_names() -> None:

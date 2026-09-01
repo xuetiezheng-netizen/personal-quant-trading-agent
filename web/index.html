@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light" />
-    <title>个人量化研究台</title>
+    <title>长期持仓波段助手</title>
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -13,8 +13,8 @@
       <header class="topbar">
         <div>
           <p class="eyebrow">PERSONAL QUANT · LOCAL ONLY</p>
-          <h1>个人量化研究台</h1>
-          <p class="subtitle">把演示、公开行情研究和 Codex 解读放在一个入口里。</p>
+          <h1>长期持仓波段助手</h1>
+          <p class="subtitle">给长期持仓增加一层温和的日线观察，核心仓不动。</p>
         </div>
         <div class="topbar-actions">
           <span class="connection-pill" id="connection-pill"><i></i>正在连接</span>
@@ -23,136 +23,167 @@
       </header>
 
       <main>
-        <section class="hero-card">
+        <section class="hero-card hero-card-swing" aria-labelledby="hero-title">
           <div class="hero-copy">
-            <span class="hero-kicker">新手模式</span>
-            <h2>先演示，再做真实研究</h2>
-            <p>建议第一次使用时按顺序点击下方按钮。所有研究都只生成报告，不会下单、不连接券商。</p>
+            <span class="hero-kicker">小白友好 · 观察模式</span>
+            <h2 id="hero-title">只观察机动仓，不动长期核心仓</h2>
+            <p>它用已经收盘的日线，寻找相对低位或高位的阶段信号，帮助你复盘和观察持仓节奏。默认 20% 只是可编辑的历史模拟假设，不是建议配置。</p>
           </div>
-          <div class="hero-note">
-            <span class="note-mark">i</span>
-            <div>
-              <strong>当前边界</strong>
-              <p>本页面只在本机打开，数据来自公开行情；结果仅供学习和研究参考。</p>
-            </div>
-          </div>
-        </section>
-
-        <section class="section-block" aria-labelledby="status-title">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">OVERVIEW</p>
-              <h2 id="status-title">当前状态</h2>
-            </div>
-            <span class="updated-at" id="updated-at">等待首次刷新</span>
-          </div>
-          <div class="status-grid">
-            <article class="status-card">
-              <span class="status-label">最近演示报告</span>
-              <strong class="status-value" id="latest-demo">尚未生成</strong>
-              <small>离线内置数据</small>
-            </article>
-            <article class="status-card">
-              <span class="status-label">最近收盘快照</span>
-              <strong class="status-value" id="latest-snapshot">尚未生成</strong>
-              <small>工作日 15:01–15:15</small>
-            </article>
-            <article class="status-card status-card-accent">
-              <span class="status-label">最近真实研究</span>
-              <strong class="status-value" id="latest-real">尚未生成</strong>
-              <small>基于完整收盘快照</small>
-            </article>
-            <article class="status-card">
-              <span class="status-label">最近 Codex 解读</span>
-              <strong class="status-value" id="latest-codex">尚未生成</strong>
-              <small>需要单独确认用量</small>
-            </article>
+          <div class="hero-note hero-note-list">
+            <strong>使用边界</strong>
+            <span>核心仓不动</span>
+            <span>日线中低频，数周到数月</span>
+            <span>无券商、无自动交易</span>
           </div>
         </section>
 
-        <section class="section-block" aria-labelledby="workflow-title">
-          <div class="section-heading">
+        <section class="section-block holdings-section" aria-labelledby="holdings-title">
+          <div class="section-heading section-heading-wrap">
             <div>
-              <p class="eyebrow">WORKFLOW</p>
-              <h2 id="workflow-title">研究流程</h2>
+              <p class="eyebrow">MY HOLDINGS · LOCAL</p>
+              <h2 id="holdings-title">我的持仓</h2>
+              <p class="section-intro">只在本机保存。名称、数量、成本和模拟比例不会写入 GitHub。</p>
             </div>
-            <span class="running-badge hidden" id="running-badge">任务运行中</span>
+            <button class="button button-primary" type="button" data-ui-action="add-holding">新增持仓</button>
           </div>
-          <div class="workflow-grid">
-            <article class="workflow-card">
-              <div class="step-number">01</div>
-              <div class="step-content">
-                <h3>先看演示</h3>
-                <p>用内置数据快速熟悉报告结构，不联网，也不消耗模型用量。</p>
-                <button class="button button-primary" type="button" data-task="demo">运行演示</button>
-              </div>
-            </article>
-            <article class="workflow-card">
-              <div class="step-number">02</div>
-              <div class="step-content">
-                <h3>收盘后取数</h3>
-                <p>只允许在工作日 15:01–15:15 获取公开新浪收盘快照。</p>
-                <button class="button button-secondary" type="button" data-task="capture_close">获取收盘快照</button>
-              </div>
-            </article>
-            <article class="workflow-card">
-              <div class="step-number">03</div>
-              <div class="step-content">
-                <h3>生成真实研究</h3>
-                <p>使用已保存的完整快照，生成带数据时点和风险说明的 Markdown 报告。</p>
-                <button class="button button-secondary" type="button" data-task="research">生成真实研究</button>
-              </div>
-            </article>
-            <article class="workflow-card workflow-card-review">
-              <div class="step-number">04</div>
-              <div class="step-content">
-                <h3>让 Codex 解读</h3>
-                <p>只分析最新真实报告，不联网、不改文件、不执行报告中的指令。</p>
-                <button class="button button-dark" type="button" data-task="codex_review">Codex 解读最新报告</button>
-              </div>
-            </article>
-          </div>
-        </section>
 
-        <section class="lower-grid">
-          <article class="panel steps-panel">
+          <div class="notice notice-info" id="personal-notice" role="status">
+            <span class="notice-mark">i</span>
+            <span>持仓数据通过本机令牌访问，仅用于你的本地分析；页面不会连接券商或自动执行操作。</span>
+          </div>
+          <div class="notice notice-error hidden" id="holdings-error" role="alert"></div>
+
+          <div class="empty-state" id="holdings-empty">
+            <div class="empty-icon">＋</div>
+            <h3>还没有本机持仓数据</h3>
+            <p>先添加一条持仓，系统才会为它读取公开日线并显示阶段判断。示例代码请使用虚构的 999999。</p>
+            <button class="button button-secondary" type="button" data-ui-action="add-holding">添加第一条持仓</button>
+          </div>
+          <div class="holding-grid" id="holdings-list" aria-live="polite"></div>
+
+          <form class="holding-form panel hidden" id="holding-form" novalidate>
             <div class="panel-heading">
               <div>
-                <p class="eyebrow">QUICK GUIDE</p>
-                <h2>你现在该做什么</h2>
+                <p class="eyebrow">LOCAL RECORD</p>
+                <h3 id="holding-form-title">新增持仓</h3>
               </div>
+              <span class="form-hint">仅保存到本机</span>
             </div>
-            <ol class="guide-list">
-              <li><span>1</span><div><strong>第一次使用</strong><p>先点“运行演示”，确认你能看到一份报告。</p></div></li>
-              <li><span>2</span><div><strong>交易日收盘后</strong><p>先点“获取收盘快照”，成功后再点“生成真实研究”。</p></div></li>
-              <li><span>3</span><div><strong>需要文字解读时</strong><p>确认报告时点正确，再点 Codex；页面会再次提醒账户用量。</p></div></li>
-            </ol>
-          </article>
-          <article class="panel files-panel">
-            <div class="panel-heading">
-              <div>
-                <p class="eyebrow">OUTPUTS</p>
-                <h2>结果文件</h2>
-              </div>
+            <div class="form-grid">
+              <label class="field">
+                <span>证券代码</span>
+                <input id="holding-code" name="code" inputmode="numeric" autocomplete="off" maxlength="6" pattern="[0-9]{6}" placeholder="例如 999999" required />
+                <small>6 位数字；不要填名称代替代码</small>
+              </label>
+              <label class="field">
+                <span>名称</span>
+                <input id="holding-name" name="name" autocomplete="off" maxlength="100" placeholder="例如 学习用标的" required />
+              </label>
+              <label class="field">
+                <span>资产类型</span>
+                <select id="holding-asset-type" name="asset_type" required>
+                  <option value="stock">股票</option>
+                  <option value="etf">ETF</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>持仓数量</span>
+                <input id="holding-quantity" name="quantity" type="number" min="1" step="1" inputmode="numeric" required />
+              </label>
+              <label class="field">
+                <span>持仓成本（元）</span>
+                <input id="holding-cost" name="avg_cost_cny" type="number" min="0.0001" step="0.001" inputmode="decimal" required />
+              </label>
+              <label class="field field-wide">
+                <span>机动仓模拟比例 <output id="holding-tactical-output">20%</output></span>
+                <input id="holding-tactical" name="tactical_ratio" type="range" min="0" max="50" step="1" value="20" />
+                <small>0–50%，只影响历史模拟；默认 20% 不是建议，也不会改动你的真实持仓。</small>
+              </label>
             </div>
-            <div class="folder-actions">
-              <button class="folder-row" type="button" data-folder="data"><span class="folder-icon">↗</span><span><strong>打开全部结果文件夹</strong><small>演示、快照与研究报告</small></span><span class="arrow">→</span></button>
-              <button class="folder-row" type="button" data-folder="codex_reviews"><span class="folder-icon">↗</span><span><strong>打开 Codex 解读文件夹</strong><small>模型解读结果</small></span><span class="arrow">→</span></button>
+            <div class="form-actions">
+              <button class="button button-primary" type="submit">保存本机记录</button>
+              <button class="button button-quiet" type="button" data-ui-action="cancel-holding">取消</button>
             </div>
-          </article>
+            <p class="form-error hidden" id="holding-form-error" role="alert"></p>
+          </form>
         </section>
 
-        <section class="panel log-panel" aria-labelledby="log-title">
-          <div class="panel-heading log-heading">
+        <section class="section-block results-section" aria-labelledby="results-title">
+          <div class="section-heading">
             <div>
-              <p class="eyebrow">ACTIVITY</p>
-              <h2 id="log-title">运行日志</h2>
+              <p class="eyebrow">DAILY SWING VIEW</p>
+              <h2 id="results-title">阶段判断与历史模拟</h2>
             </div>
-            <span class="log-state" id="log-state">暂无任务</span>
+            <div class="heading-actions">
+              <span class="updated-at" id="swing-updated-at">等待收盘数据</span>
+              <button class="button button-quiet button-small" type="button" data-folder="private_reports">打开个人报告</button>
+              <button class="button button-quiet button-small" type="button" data-swing-action="all">更新全部判断与模拟</button>
+            </div>
           </div>
-          <div class="log-box" id="log-box"><p class="log-empty">点击上方任意操作后，输出会显示在这里。</p></div>
-          <div class="result-line hidden" id="result-line"><span>结果文件</span><code id="result-path"></code></div>
+          <div class="notice notice-warning">
+            <span class="notice-mark">!</span>
+            <span>阶段判断不是买卖指令。数据不足时会明确提示；历史模拟只回答“过去如果这样做会怎样”，不预测未来。</span>
+          </div>
+          <div class="simulation-panel panel hidden" id="simulation-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">BACKTEST SUMMARY</p>
+                <h3>最近一次历史模拟</h3>
+              </div>
+              <span class="form-hint" id="simulation-label">仅供复盘</span>
+            </div>
+            <div class="metric-grid" id="simulation-metrics"></div>
+            <p class="panel-footnote" id="simulation-note"></p>
+          </div>
+          <div class="results-empty" id="results-empty">添加持仓并点击“更新阶段判断”后，这里会显示收盘后的观察结果。</div>
+          <div class="result-list" id="swing-results" aria-live="polite"></div>
         </section>
+
+        <details class="legacy-tools" id="legacy-tools">
+          <summary>
+            <span><span class="eyebrow">ORIGINAL RESEARCH TOOLS</span><strong>原有研究工具</strong></span>
+            <small>演示、全市场收盘快照和 Codex 报告</small>
+          </summary>
+
+          <section class="section-block legacy-status" aria-labelledby="status-title">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">OVERVIEW</p>
+                <h2 id="status-title">原有工具状态</h2>
+              </div>
+              <span class="updated-at" id="updated-at">等待首次刷新</span>
+            </div>
+            <div class="status-grid">
+              <article class="status-card"><span class="status-label">最近演示报告</span><strong class="status-value" id="latest-demo">尚未生成</strong><small>离线内置数据</small></article>
+              <article class="status-card"><span class="status-label">最近收盘快照</span><strong class="status-value" id="latest-snapshot">尚未生成</strong><small>工作日 15:01–15:15</small></article>
+              <article class="status-card status-card-accent"><span class="status-label">最近真实研究</span><strong class="status-value" id="latest-real">尚未生成</strong><small>基于完整收盘快照</small></article>
+              <article class="status-card"><span class="status-label">最近 Codex 解读</span><strong class="status-value" id="latest-codex">尚未生成</strong><small>需要单独确认用量</small></article>
+            </div>
+          </section>
+
+          <section class="section-block" aria-labelledby="workflow-title">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">WORKFLOW</p>
+                <h2 id="workflow-title">原有研究流程</h2>
+              </div>
+              <span class="running-badge hidden" id="running-badge">任务运行中</span>
+            </div>
+            <div class="workflow-grid">
+              <article class="workflow-card"><div class="step-number">01</div><div class="step-content"><h3>先看演示</h3><p>用内置数据熟悉报告结构，不联网，也不消耗模型用量。</p><button class="button button-primary" type="button" data-task="demo">运行演示</button></div></article>
+              <article class="workflow-card"><div class="step-number">02</div><div class="step-content"><h3>收盘后取数</h3><p>只允许在工作日 15:01–15:15 获取公开新浪收盘快照。</p><button class="button button-secondary" type="button" data-task="capture_close">获取收盘快照</button></div></article>
+              <article class="workflow-card"><div class="step-number">03</div><div class="step-content"><h3>生成真实研究</h3><p>使用已保存的完整快照，生成带数据时点和风险说明的 Markdown 报告。</p><button class="button button-secondary" type="button" data-task="research">生成真实研究</button></div></article>
+              <article class="workflow-card workflow-card-review"><div class="step-number">04</div><div class="step-content"><h3>让 Codex 解读</h3><p>只分析最新真实报告，不联网、不改文件、不执行报告中的操作。</p><button class="button button-dark" type="button" data-task="codex_review">Codex 解读最新报告</button></div></article>
+            </div>
+          </section>
+
+          <section class="lower-grid">
+            <article class="panel steps-panel"><div class="panel-heading"><div><p class="eyebrow">QUICK GUIDE</p><h2>原有工具怎么用</h2></div></div><ol class="guide-list"><li><span>1</span><div><strong>第一次使用</strong><p>先点“运行演示”，确认你能看到一份报告。</p></div></li><li><span>2</span><div><strong>交易日收盘后</strong><p>先点“获取收盘快照”，成功后再点“生成真实研究”。</p></div></li><li><span>3</span><div><strong>需要文字解读时</strong><p>确认报告时点正确，再点 Codex；页面会提醒账户用量。</p></div></li></ol></article>
+            <article class="panel files-panel"><div class="panel-heading"><div><p class="eyebrow">OUTPUTS</p><h2>结果文件</h2></div></div><div class="folder-actions"><button class="folder-row" type="button" data-folder="data"><span class="folder-icon">↗</span><span><strong>打开全部结果文件夹</strong><small>演示、快照与研究报告</small></span><span class="arrow">→</span></button><button class="folder-row" type="button" data-folder="codex_reviews"><span class="folder-icon">↗</span><span><strong>打开 Codex 解读文件夹</strong><small>模型解读结果</small></span><span class="arrow">→</span></button></div></article>
+          </section>
+
+          <section class="panel log-panel" aria-labelledby="log-title"><div class="panel-heading log-heading"><div><p class="eyebrow">ACTIVITY</p><h2 id="log-title">原有运行日志</h2></div><span class="log-state" id="log-state">暂无任务</span></div><div class="log-box" id="log-box"><p class="log-empty">点击原有工具操作后，输出会显示在这里。</p></div><div class="result-line hidden" id="result-line"><span>结果文件</span><code id="result-path"></code></div></section>
+        </details>
 
         <section class="footer-actions">
           <p>服务仅绑定本机 <code>127.0.0.1:8765</code>。关闭页面不会自动停止服务。</p>
@@ -161,6 +192,7 @@
       </main>
     </div>
 
+    <noscript><div class="noscript-warning">需要启用 JavaScript 才能使用本地持仓窗口。</div></noscript>
     <script>window.__LOCAL_TOKEN__ = "__LOCAL_TOKEN_VALUE__";</script>
     <script src="/app.js" defer></script>
   </body>

@@ -18,6 +18,10 @@ build/
 
 # 运行数据与日志
 data/
+# 个人持仓、个人分析结果与历史模拟报告（仅保存在本机，严禁提交）
+data/private/
+# Playwright 页面快照可能包含本机持仓页面内容，同样不得提交
+.playwright-cli/
 *.db
 *.sqlite
 *.sqlite3

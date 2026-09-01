@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -26,6 +27,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from trading_agent.swing.portfolio import (
+    PortfolioRevisionConflictError,
+    PortfolioStorageError,
+    PortfolioStore,
+    PortfolioValidationError,
+)
+
 APP_ID = "personal-quant-trading-agent-web"
 HOST = "127.0.0.1"
 PORT = 8765
@@ -38,6 +46,10 @@ DATA_DIR = REPO_ROOT / "data"
 REPORTS_DIR = REPO_ROOT / "data" / "reports"
 DEMO_REPORTS_DIR = REPO_ROOT / "data" / "demo_reports"
 CODEX_REVIEWS_DIR = REPO_ROOT / "data" / "codex_reviews"
+PRIVATE_DATA_DIR = REPO_ROOT / "data" / "private"
+PRIVATE_HOLDINGS_PATH = PRIVATE_DATA_DIR / "holdings.json"
+PRIVATE_RESULTS_PATH = PRIVATE_DATA_DIR / "latest-results.json"
+PRIVATE_REPORTS_DIR = PRIVATE_DATA_DIR / "reports"
 
 # These are the only workflow action names accepted by the HTTP API.  The
 # values are argument tuples, not user-controlled shell fragments.
@@ -52,9 +64,39 @@ ACTION_LABELS: dict[str, str] = {
     "research": "生成真实研究",
     "codex_review": "Codex 解读最新真实报告",
 }
+# Swing actions are deliberately a separate namespace from the existing demo and
+# research actions.  The HTTP layer accepts only these three values and builds
+# their argv itself; it never treats a browser value as a script or shell text.
+SWING_ACTIONS = frozenset({"analyze", "backtest", "all"})
+SWING_ACTION_LABELS: dict[str, str] = {
+    "analyze": "分析持仓波段状态",
+    "backtest": "回放持仓波段效果",
+    "all": "分析并回放持仓波段",
+}
+_HOLDING_FIELDS = frozenset(
+    {
+        "code",
+        "name",
+        "asset_type",
+        "quantity",
+        "avg_cost_cny",
+        "acquired_date",
+        "note",
+        "revision",
+        "tactical_ratio",
+    }
+)
+_HOLDING_MUTATION_FIELDS = _HOLDING_FIELDS - {"revision"}
+_SWING_ACTION_FIELDS = frozenset({"action", "code", "asset_type"})
+_CODE_PATTERN = r"^[0-9]{6}$"
+_ASSET_TYPES = frozenset({"stock", "etf"})
+FOLDER_RELATIVE_PATHS: dict[str, Path] = {
+    "data": Path("data"),
+    "codex_reviews": Path("data") / "codex_reviews",
+    "private_reports": Path("data") / "private" / "reports",
+}
 FOLDER_PATHS: dict[str, Path] = {
-    "data": DATA_DIR,
-    "codex_reviews": CODEX_REVIEWS_DIR,
+    key: REPO_ROOT / relative_path for key, relative_path in FOLDER_RELATIVE_PATHS.items()
 }
 STATIC_FILES: dict[str, str] = {
     "/": "index.html",
@@ -140,9 +182,135 @@ def _safe_display_path(path: Path | None, repo_root: Path = REPO_ROOT) -> str | 
     if path is None:
         return None
     try:
-        return str(path.resolve().relative_to(repo_root.resolve()))
+        # API paths are portable display values even though the service runs on
+        # Windows; they are never accepted back as filesystem input.
+        return str(path.resolve().relative_to(repo_root.resolve())).replace("\\", "/")
     except ValueError:
         return None
+
+
+def latest_swing_results(repo_root: Path = REPO_ROOT) -> Path | None:
+    """Return the one fixed private swing-result document, if it exists."""
+
+    try:
+        path = _fixed_private_path(repo_root, "data/private/latest-results.json")
+    except WebAppError:
+        return None
+    return path if path.is_file() else None
+
+
+def latest_swing_report(repo_root: Path = REPO_ROOT) -> Path | None:
+    """Return the newest Markdown report from the fixed private report folder."""
+
+    try:
+        report_dir = _fixed_private_path(repo_root, "data/private/reports")
+    except WebAppError:
+        return None
+    return _latest_file(report_dir, "*.md")
+
+
+def _fixed_private_path(repo_root: Path, relative_path: str) -> Path:
+    """Resolve a server-owned private path without accepting browser input."""
+
+    root = repo_root.resolve()
+    private_root = (root / "data" / "private").resolve()
+    path = (root / relative_path).resolve()
+    try:
+        path.relative_to(private_root)
+    except ValueError as exc:
+        raise WebAppError("私有结果路径配置无效。") from exc
+    return path
+
+
+def _safe_result_value(value: Any, repo_root: Path, *, key: str = "") -> Any:
+    """Copy JSON result data while hiding stacks and absolute filesystem paths.
+
+    The result file is produced by a fixed local script, but it is still treated
+    as untrusted display data.  In particular, a failed run must not turn an
+    exception traceback or local path into an HTTP response.
+    """
+
+    lowered_key = key.casefold()
+    if lowered_key in {
+        "traceback",
+        "stack",
+        "stacktrace",
+        "stack_trace",
+        "exception",
+        "stderr",
+        "absolute_path",
+        "absolutepath",
+    }:
+        return "[诊断信息已隐藏]"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _safe_result_value(item_value, repo_root, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_result_value(item, repo_root, key=key) for item in value]
+    if isinstance(value, str):
+        if "traceback (most recent call last)" in value.casefold():
+            return "[诊断信息已隐藏]"
+        # Keep relative report paths useful while ensuring absolute paths never
+        # leave the service.  Both slash styles occur in Windows JSON output.
+        repo_text = str(repo_root.resolve())
+        for prefix in (repo_text, repo_text.replace("\\", "/")):
+            if value.startswith(prefix):
+                relative = _safe_display_path(Path(value), repo_root)
+                return relative or "[本地路径已隐藏]"
+            value = value.replace(prefix, "<项目目录>")
+        if re.search(r"(?:[A-Za-z]:[\\/]|\\\\)[^\s\"']+", value):
+            return "[本地路径已隐藏]"
+        return value
+    return value
+
+
+def read_swing_results(repo_root: Path = REPO_ROOT) -> dict[str, Any]:
+    """Read only the fixed private result JSON and report directory.
+
+    Returned paths are repository-relative.  This endpoint intentionally does
+    not accept a path or filename query parameter.
+    """
+
+    latest_path = latest_swing_results(repo_root)
+    result_payload: Any = None
+    if latest_path is not None:
+        try:
+            result_payload = json.loads(latest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise WebAppError("最新波段结果暂时无法读取。") from exc
+
+    report_dir = _fixed_private_path(repo_root, "data/private/reports")
+    report_paths: list[dict[str, str]] = []
+    if report_dir.is_dir():
+        reports = sorted(
+            (path for path in report_dir.glob("*.md") if path.is_file()),
+            key=lambda path: (path.stat().st_mtime_ns, path.name),
+            reverse=True,
+        )
+        for path in reports:
+            relative = _safe_display_path(path, repo_root)
+            if relative is not None:
+                report_paths.append({"path": relative, "name": path.name})
+
+    latest_relative = _safe_display_path(latest_path, repo_root)
+    latest_report_relative = report_paths[0]["path"] if report_paths else None
+    safe_result = _safe_result_value(result_payload, repo_root)
+    response: dict[str, Any] = {
+        "latest_results_path": latest_relative,
+        "latest_report_path": latest_report_relative,
+        "reports": report_paths,
+        "result": safe_result,
+    }
+    # Keep the useful, stable fields available at the top level for the browser
+    # while retaining ``result`` as an explicit namespaced copy for callers that
+    # prefer not to depend on the JSON document shape.
+    if isinstance(safe_result, dict):
+        for key in ("schema_version", "updated_at", "results", "mode"):
+            if key in safe_result:
+                response[key] = safe_result[key]
+    return response
 
 
 def _find_powershell() -> str:
@@ -165,6 +333,18 @@ def _bounded_output(raw: bytes | str) -> str:
     # Keep the tail: PowerShell normally prints the useful error at the end.
     encoded = text.encode("utf-8")[-MAX_LOG_BYTES:]
     return "[日志过长，已截取末尾]\n" + encoded.decode("utf-8", errors="replace")
+
+
+def _safe_task_output(raw: bytes | str, repo_root: Path) -> str:
+    """Keep task logs useful without returning local paths or tracebacks."""
+
+    text = _bounded_output(raw)
+    if "traceback (most recent call last)" in text.casefold():
+        return "任务失败；详细诊断堆栈未在浏览器中展示。"
+    root_text = str(repo_root.resolve())
+    for prefix in (root_text, root_text.replace("\\", "/")):
+        text = text.replace(prefix, "<项目目录>")
+    return re.sub(r"(?i)(?<!https:)(?<!http:)(?:[A-Za-z]:[\\/][^\s\r\n]+)", "<本地路径已隐藏>", text)
 
 
 def _script_command(repo_root: Path, action: str) -> list[str]:
@@ -224,6 +404,71 @@ def command_for_action(action: str, repo_root: Path = REPO_ROOT) -> list[str]:
     return _script_command(repo_root, action)
 
 
+def _validate_swing_selector(code: object = None, asset_type: object = None) -> tuple[str | None, str | None]:
+    """Validate the optional selector used by the fixed swing command."""
+
+    if (code is None) != (asset_type is None):
+        raise WebAppError("指定波段标的时必须同时提供 code 和 asset_type。")
+    if code is None and asset_type is None:
+        return None, None
+    if not isinstance(code, str) or re.fullmatch(_CODE_PATTERN, code) is None:
+        raise WebAppError("code 必须是6位数字。")
+    if not isinstance(asset_type, str) or asset_type not in _ASSET_TYPES:
+        raise WebAppError("asset_type 只能是 stock 或 etf。")
+    return code, asset_type
+
+
+def _swing_command(
+    repo_root: Path,
+    action: str,
+    *,
+    code: object = None,
+    asset_type: object = None,
+) -> list[str]:
+    """Build the only permitted argv for the local swing runner.
+
+    The executable and script are repository-owned fixed paths.  ``shell=False``
+    is enforced by :class:`TaskManager`; this function only returns argv data and
+    never concatenates a browser value into a command string.
+    """
+
+    if action not in SWING_ACTIONS:
+        raise WebAppError("不支持的波段操作。请从固定按钮中选择。")
+    normalized_code, normalized_asset_type = _validate_swing_selector(code, asset_type)
+    root = repo_root.resolve()
+    python_path = root / ".venv" / "Scripts" / "python.exe"
+    script_path = root / "scripts" / "run_swing.py"
+    if not python_path.is_file():
+        raise WebAppError("找不到项目虚拟环境 Python，无法运行波段流程。")
+    if not script_path.is_file():
+        raise WebAppError("找不到波段流程脚本：run_swing.py")
+    # ``run_swing.py`` declares the mode as its only positional argument and
+    # accepts a fixed ``--code`` selector.  ``asset_type`` is validated at the
+    # HTTP boundary for an unambiguous request, while the runner resolves the
+    # actual type from the private holding record.
+    argv = [str(python_path), "-X", "utf8", str(script_path), action]
+    if normalized_code is not None and normalized_asset_type is not None:
+        argv.extend(("--code", normalized_code, "--asset-type", normalized_asset_type))
+    return argv
+
+
+def command_for_swing_action(
+    action: str,
+    repo_root: Path = REPO_ROOT,
+    *,
+    code: object = None,
+    asset_type: object = None,
+) -> list[str]:
+    """Public test seam for the fixed swing runner argv."""
+
+    return _swing_command(repo_root, action, code=code, asset_type=asset_type)
+
+
+# Backwards-friendly descriptive alias for tests or local callers that prefer
+# the verb before the noun.
+swing_command_for_action = command_for_swing_action
+
+
 @dataclass
 class TaskManager:
     repo_root: Path = REPO_ROOT
@@ -236,12 +481,28 @@ class TaskManager:
         with self._lock:
             return self._current
 
-    def start(self, action: str, *, confirm_usage: bool = False) -> TaskState:
+    def start(
+        self,
+        action: str,
+        *,
+        confirm_usage: bool = False,
+        code: object = None,
+        asset_type: object = None,
+    ) -> TaskState:
         with self._lock:
             if self._current is not None and self._current.status == "running":
                 raise TaskBusyError("已有任务正在运行，请等待它完成后再试。")
 
-            if action == "codex_review":
+            if action in SWING_ACTIONS:
+                # The command builder validates the selector and appends only
+                # the two fixed option names understood by run_swing.py.
+                argv = _swing_command(
+                    self.repo_root,
+                    action,
+                    code=code,
+                    asset_type=asset_type,
+                )
+            elif action == "codex_review":
                 if confirm_usage is not True:
                     raise WebAppError("调用 Codex 前必须确认：报告内容会发送给 ChatGPT/Codex，并消耗账户用量。")
                 report = latest_real_report(self.repo_root)
@@ -254,7 +515,7 @@ class TaskManager:
             task = TaskState(
                 task_id=uuid.uuid4().hex,
                 action=action,
-                label=ACTION_LABELS.get(action, action),
+                label=SWING_ACTION_LABELS.get(action, ACTION_LABELS.get(action, action)),
                 started_at=_now_text(),
             )
             self._current = task
@@ -279,10 +540,10 @@ class TaskManager:
             )
             raw_output, _ = process.communicate()
             exit_code = int(process.returncode)
-            output = _bounded_output(raw_output or b"")
-        except Exception as exc:  # noqa: BLE001 - surface worker failures in the UI
+            output = _safe_task_output(raw_output or b"", self.repo_root)
+        except Exception:  # noqa: BLE001 - surface worker failures in the UI
             exit_code = 1
-            output = f"启动工作流失败：{exc}"
+            output = "启动工作流失败；详细诊断未在浏览器中展示。"
 
         with self._lock:
             task.exit_code = exit_code
@@ -301,6 +562,8 @@ class TaskManager:
             return latest_real_report(self.repo_root)
         if action == "codex_review":
             return latest_codex_review(self.repo_root)
+        if action in SWING_ACTIONS:
+            return latest_swing_results(self.repo_root) or latest_swing_report(self.repo_root)
         return None
 
     def snapshot(self) -> dict[str, Any]:
@@ -315,6 +578,12 @@ class TaskManager:
                 "latest_snapshot": _safe_display_path(_latest_snapshot(self.repo_root), self.repo_root),
                 "latest_real_report": _safe_display_path(latest_real_report(self.repo_root), self.repo_root),
                 "latest_codex_review": _safe_display_path(latest_codex_review(self.repo_root), self.repo_root),
+                "latest_swing_results": _safe_display_path(
+                    latest_swing_results(self.repo_root), self.repo_root
+                ),
+                "latest_swing_report": _safe_display_path(
+                    latest_swing_report(self.repo_root), self.repo_root
+                ),
             },
         }
 
@@ -326,6 +595,10 @@ class LocalWebApplication:
         self.repo_root = repo_root.resolve()
         self.token = token or secrets.token_urlsafe(32)
         self.tasks = TaskManager(self.repo_root)
+        # The browser can use this store only through authenticated routes. Its
+        # path is derived solely from the server repository root; no request
+        # field is ever treated as a filesystem path.
+        self.holdings_store = PortfolioStore(self.repo_root / "data" / "private" / "holdings.json")
         self._shutdown_requested = threading.Event()
 
     def render_index(self) -> bytes:
@@ -410,13 +683,147 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    @staticmethod
+    def _holding_route(path: str) -> tuple[str, str] | None:
+        """Strictly parse the two path parameters for a holding endpoint."""
+
+        decoded = unquote(path)
+        parts = decoded.split("/")
+        if len(parts) != 5 or parts[0:3] != ["", "api", "holdings"]:
+            return None
+        asset_type, code = parts[3], parts[4]
+        if asset_type not in _ASSET_TYPES or re.fullmatch(_CODE_PATTERN, code) is None:
+            return None
+        return asset_type, code
+
+    def _portfolio_error(self, exc: Exception) -> None:
+        if isinstance(exc, PortfolioRevisionConflictError):
+            self._error("持仓数据已被更新，请刷新后重试。", HTTPStatus.CONFLICT)
+        elif isinstance(exc, PortfolioValidationError):
+            self._error(str(exc), HTTPStatus.BAD_REQUEST)
+        elif isinstance(exc, PortfolioStorageError):
+            self._error("本机私有持仓暂时无法读取或保存。", HTTPStatus.INTERNAL_SERVER_ERROR)
+        else:
+            # Do not turn an implementation traceback or filesystem path into
+            # a response body.
+            self._error("本机私有持仓操作失败。", HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _validate_payload_fields(self, payload: dict[str, Any], allowed: frozenset[str]) -> bool:
+        if set(payload) - allowed:
+            self._error("请求包含不支持的字段。", HTTPStatus.BAD_REQUEST)
+            return False
+        return True
+
+    def _expected_revision(self, payload: dict[str, Any], *, required: bool) -> int | None:
+        if "expected_revision" not in payload:
+            if required:
+                self._error("expected_revision 必须是非负整数。", HTTPStatus.BAD_REQUEST)
+            return None
+        value = payload["expected_revision"]
+        if type(value) is not int or value < 0:
+            self._error("expected_revision 必须是非负整数。", HTTPStatus.BAD_REQUEST)
+            return None
+        return value
+
+    def _send_snapshot(self, snapshot: Any, status: int = HTTPStatus.OK) -> None:
+        self._send_json({"ok": True, **snapshot.as_dict()}, status)
+
+    def _handle_holdings_get(self) -> None:
+        try:
+            self._send_snapshot(self.app.holdings_store.load())
+        except Exception as exc:  # noqa: BLE001 - sanitize all private-store failures
+            self._portfolio_error(exc)
+
+    def _handle_holdings_post(self, payload: dict[str, Any]) -> None:
+        allowed = _HOLDING_MUTATION_FIELDS | {"expected_revision"}
+        if not self._validate_payload_fields(payload, allowed):
+            return
+        expected_revision = self._expected_revision(payload, required=False)
+        if "expected_revision" in payload and expected_revision is None:
+            return
+        record = {key: value for key, value in payload.items() if key != "expected_revision"}
+        try:
+            snapshot = self.app.holdings_store.add_holding(
+                record, expected_revision=expected_revision
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitize all private-store failures
+            self._portfolio_error(exc)
+        else:
+            self._send_snapshot(snapshot, HTTPStatus.CREATED)
+
+    def _handle_holdings_put(self, parsed_path: str, payload: dict[str, Any]) -> None:
+        route = self._holding_route(parsed_path)
+        if route is None:
+            self._error("持仓接口路径无效。", HTTPStatus.NOT_FOUND)
+            return
+        if not self._validate_payload_fields(payload, _HOLDING_MUTATION_FIELDS | {"expected_revision"}):
+            return
+        expected_revision = self._expected_revision(payload, required=True)
+        if expected_revision is None:
+            return
+        asset_type, code = route
+        for identity_field, route_value in (("code", code), ("asset_type", asset_type)):
+            if identity_field in payload and payload[identity_field] != route_value:
+                self._error(f"{identity_field} 与路径不一致。", HTTPStatus.BAD_REQUEST)
+                return
+        changes = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"expected_revision", "code", "asset_type"}
+        }
+        try:
+            snapshot = self.app.holdings_store.update_holding(
+                code,
+                changes,
+                asset_type=asset_type,
+                expected_revision=expected_revision,
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitize all private-store failures
+            self._portfolio_error(exc)
+        else:
+            self._send_snapshot(snapshot)
+
+    def _handle_holdings_delete(self, parsed_path: str, payload: dict[str, Any]) -> None:
+        route = self._holding_route(parsed_path)
+        if route is None:
+            self._error("持仓接口路径无效。", HTTPStatus.NOT_FOUND)
+            return
+        if set(payload) != {"expected_revision"}:
+            self._error("删除持仓只接受 expected_revision。", HTTPStatus.BAD_REQUEST)
+            return
+        expected_revision = self._expected_revision(payload, required=True)
+        if expected_revision is None:
+            return
+        asset_type, code = route
+        try:
+            snapshot = self.app.holdings_store.delete_holding(
+                code,
+                asset_type=asset_type,
+                expected_revision=expected_revision,
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitize all private-store failures
+            self._portfolio_error(exc)
+        else:
+            self._send_snapshot(snapshot)
+
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
         if parsed.path == "/api/health":
             self._send_json({"ok": True, "app_id": APP_ID, "host": HOST, "port": PORT})
             return
+        if parsed.path in {"/api/status", "/api/holdings", "/api/swing-results"} and not self._check_token():
+            return
         if parsed.path == "/api/status":
             self._send_json({"ok": True, **self.app.status()})
+            return
+        if parsed.path == "/api/holdings":
+            self._handle_holdings_get()
+            return
+        if parsed.path == "/api/swing-results":
+            try:
+                self._send_json({"ok": True, **read_swing_results(self.app.repo_root)})
+            except WebAppError as exc:
+                self._error(str(exc), HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         relative = unquote(parsed.path)
@@ -441,12 +848,72 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_bytes(body, CONTENT_TYPES[path.suffix])
 
+    def do_PUT(self) -> None:
+        if not self._check_token():
+            return
+        parsed = urlsplit(self.path)
+        if not parsed.path.startswith("/api/holdings/"):
+            self._error("找不到接口。", HTTPStatus.NOT_FOUND)
+            return
+        payload = self._read_json()
+        if payload is None:
+            return
+        self._handle_holdings_put(parsed.path, payload)
+
+    def do_DELETE(self) -> None:
+        if not self._check_token():
+            return
+        parsed = urlsplit(self.path)
+        if not parsed.path.startswith("/api/holdings/"):
+            self._error("找不到接口。", HTTPStatus.NOT_FOUND)
+            return
+        payload = self._read_json()
+        if payload is None:
+            return
+        self._handle_holdings_delete(parsed.path, payload)
+
     def do_POST(self) -> None:
         if not self._check_token():
             return
         parsed = urlsplit(self.path)
         payload = self._read_json()
         if payload is None:
+            return
+
+        if parsed.path == "/api/holdings":
+            self._handle_holdings_post(payload)
+            return
+
+        if parsed.path == "/api/swing-action":
+            if not self._validate_payload_fields(payload, _SWING_ACTION_FIELDS):
+                return
+            action = payload.get("action")
+            if not isinstance(action, str) or action not in SWING_ACTIONS:
+                self._error("不支持的波段操作。请从固定按钮中选择。", HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                selector_supplied = "code" in payload or "asset_type" in payload
+                if selector_supplied and (
+                    "code" not in payload
+                    or "asset_type" not in payload
+                    or payload.get("code") is None
+                    or payload.get("asset_type") is None
+                ):
+                    raise WebAppError("指定波段标的时必须同时提供有效的 code 和 asset_type。")
+                code, asset_type = _validate_swing_selector(
+                    payload.get("code"), payload.get("asset_type")
+                )
+                task = self.app.tasks.start(
+                    action,
+                    code=code,
+                    asset_type=asset_type,
+                )
+            except TaskBusyError as exc:
+                self._error(str(exc), HTTPStatus.CONFLICT)
+            except WebAppError as exc:
+                self._error(str(exc), HTTPStatus.BAD_REQUEST)
+            else:
+                self._send_json({"ok": True, "task": task.as_dict()}, HTTPStatus.ACCEPTED)
             return
 
         if parsed.path in {"/api/action", "/api/actions"}:
@@ -466,11 +933,11 @@ class LocalRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/open-folder":
             folder = payload.get("folder")
-            target = FOLDER_PATHS.get(folder) if isinstance(folder, str) else None
-            if target is None:
+            relative = FOLDER_RELATIVE_PATHS.get(folder) if isinstance(folder, str) else None
+            if relative is None:
                 self._error("不支持的文件夹。", HTTPStatus.BAD_REQUEST)
                 return
-            target = (self.app.repo_root / "data" / target.relative_to(REPO_ROOT / "data")).resolve()
+            target = (self.app.repo_root / relative).resolve()
             data_root = (self.app.repo_root / "data").resolve()
             try:
                 target.relative_to(data_root)
