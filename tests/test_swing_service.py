@@ -136,6 +136,15 @@ def test_backtest_reports_assumptions_and_preserves_core_boundary(tmp_path: Path
     assert payload["core_tactical"]["market_exposure"] >= result.core_weight
     assert payload["robustness"]["status"] == "ok"
     assert payload["robustness"]["direction_total"] == 4
+
+    latest = service.load_latest_results()
+    latest_backtest = next(
+        item for item in latest["results"] if item["mode"] == "backtest"
+    )
+    assert latest_backtest["static_core_cash"] == payload["static_core_cash"]
+    assert latest_backtest["deferred_count"] == result.deferred_count
+    assert latest_backtest["robustness"] == payload["robustness"]
+
     assert result.report_path is not None
     report = (tmp_path / result.report_path).read_text(encoding="utf-8")
     assert "20%" in report

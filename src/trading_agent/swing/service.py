@@ -890,8 +890,11 @@ class SwingService:
                             for summary_key in (
                                 "assumptions",
                                 "buy_and_hold",
+                                "static_core_cash",
                                 "core_tactical",
                                 "trade_events",
+                                "deferred_count",
+                                "robustness",
                             ):
                                 if summary_key in item:
                                     entry[summary_key] = item.get(summary_key)
@@ -914,8 +917,11 @@ class SwingService:
                     "error",
                     "assumptions",
                     "buy_and_hold",
+                    "static_core_cash",
                     "core_tactical",
                     "trade_events",
+                    "deferred_count",
+                    "robustness",
                 )
                 if key in payload
             }
