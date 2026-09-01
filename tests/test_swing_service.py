@@ -123,17 +123,30 @@ def test_backtest_reports_assumptions_and_preserves_core_boundary(tmp_path: Path
 
     assert result.status == "ok"
     assert result.has_performance
+    assert result.static_core_cash is not None
     assert result.core_weight == pytest.approx(0.8)
     assert result.tactical_weight == pytest.approx(0.2)
     assert result.costs.commission_bps == pytest.approx(3.0)
     assert result.costs.slippage_bps == pytest.approx(5.0)
     assert result.costs.sell_tax_bps == pytest.approx(0.0)
+    payload = result.as_dict()
+    assert payload["static_core_cash"] is not None
+    assert payload["assumptions"]["warmup_excluded"] is True
+    assert payload["assumptions"]["drawdown_basis"] == "daily_close"
+    assert payload["core_tactical"]["market_exposure"] >= result.core_weight
+    assert payload["robustness"]["status"] == "ok"
+    assert payload["robustness"]["direction_total"] == 4
     assert result.report_path is not None
     report = (tmp_path / result.report_path).read_text(encoding="utf-8")
     assert "20%" in report
     assert "核心仓比例 80% 全程保持不变" in report
     assert "下一根日线开盘" in report
     assert "手续费" in report
+    assert "静态核心与现金基准" in report
+    assert "预热" in report
+    assert "收盘口径" in report
+    assert "固定敏感性检查" in report
+    assert "不能证明未来有效" in report
     assert "不是用户真实收益" in report
     assert "买入" not in report
     assert "卖出" not in report
@@ -177,6 +190,7 @@ def test_insufficient_history_does_not_create_return_conclusion(tmp_path: Path) 
     assert analysis.status == "data_insufficient"
     assert backtest.status == "data_insufficient"
     assert backtest.buy_and_hold is None
+    assert backtest.static_core_cash is None
     assert backtest.core_tactical is None
     assert backtest.trade_events == 0
     assert backtest.report_path is not None

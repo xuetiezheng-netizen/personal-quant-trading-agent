@@ -175,6 +175,7 @@ h3 { font-size: 17px; margin-bottom: 8px; }
 .phase-date { color: #9aa5aa; font-size: 11px; margin: 0; overflow-wrap: anywhere; }
 .holding-actions { align-items: center; border-top: 1px solid #edf0f1; display: flex; flex-wrap: wrap; gap: 7px; margin-top: 15px; padding-top: 13px; }
 .button-small { font-size: 11px; min-height: 33px; padding: 7px 10px; }
+[data-ui-action="add-holding"] { white-space: nowrap; }
 .text-button { background: none; border: 0; color: #77858a; cursor: pointer; font-size: 11px; margin-left: auto; padding: 6px 3px; }
 .text-button + .text-button { margin-left: 0; }
 .text-button:hover { color: var(--ink); }

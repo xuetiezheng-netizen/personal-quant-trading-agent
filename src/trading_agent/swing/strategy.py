@@ -12,13 +12,32 @@ from trading_agent.swing.models import (
     SwingState,
 )
 
-_BULLISH_PATTERNS = {"hammer", "doji", "bullish_engulfing"}
-_BEARISH_PATTERNS = {"shooting_star", "doji", "bearish_engulfing"}
+# 十字线只表示犹豫，不作为方向性证据。方向形态必须先出现在观察日，
+# 再由下一根收盘价完成突破，避免用一根 K 线直接宣称发生了拐点。
+_BULLISH_PATTERNS = {"hammer", "bullish_engulfing"}
+_BEARISH_PATTERNS = {"shooting_star", "bearish_engulfing"}
+_DOJI_PATTERN = "doji"
 _THRESHOLD_EPSILON = 1e-9
 
 
 def _has_any_pattern(patterns: tuple[str, ...], candidates: set[str]) -> bool:
     return bool(set(patterns).intersection(candidates))
+
+
+def _has_doji(features: SwingFeatures) -> bool:
+    return _DOJI_PATTERN in features.candle_patterns
+
+
+def _bottom_trend_allows_confirmation(features: SwingFeatures) -> bool:
+    """底部信号只在已知、非下行的当前趋势环境中成立。"""
+
+    return features.trend_regime in {"up", "sideways"}
+
+
+def _top_trend_allows_confirmation(features: SwingFeatures) -> bool:
+    """顶部信号只在已知、非上行的当前趋势环境中成立。"""
+
+    return features.trend_regime in {"down", "sideways"}
 
 
 def _low_zone(features: SwingFeatures, config: SwingConfig) -> bool:
@@ -54,39 +73,59 @@ def _high_zone(features: SwingFeatures, config: SwingConfig) -> bool:
 def _bottom_confirmation(
     features: SwingFeatures,
     previous: SwingFeatures | None,
+    previous_state: SwingState | None,
     config: SwingConfig,
 ) -> bool:
-    if previous is None or not _low_zone(features, config):
+    if (
+        previous is None
+        or previous_state is not SwingState.LOW_WATCH
+        or not _low_zone(features, config)
+        or _has_doji(features)
+        or not _bottom_trend_allows_confirmation(features)
+    ):
         return False
-    close_recovered = features.close_price >= previous.close_price
+    close_recovered = features.close_price > previous.close_price + _THRESHOLD_EPSILON
     rsi_turn = (
         features.rsi is not None
         and previous.rsi is not None
-        and features.rsi >= previous.rsi + config.reversal_rsi_tolerance
+        and features.rsi > previous.rsi + config.reversal_rsi_tolerance
     )
-    pattern_confirmation = _has_any_pattern(features.candle_patterns, _BULLISH_PATTERNS)
-    # 均线趋势不是单独的方向预测；但在明确下行趋势中，只接受更直观的
-    # K 线反转作为确认，避免 RSI 一次反弹就把下跌途中误判成底部。
-    trend_allows_momentum_only = features.trend_regime != "down"
-    return close_recovered and (pattern_confirmation or (rsi_turn and trend_allows_momentum_only))
+    # 形态路线：观察日出现方向形态，确认日收盘必须真正越过观察日最高价。
+    pattern_confirmation = _has_any_pattern(previous.candle_patterns, _BULLISH_PATTERNS) and (
+        features.close_price > previous.high_price + _THRESHOLD_EPSILON
+    )
+    # 动量路线：不依赖某个形态，但必须同时看到价格和 RSI 的同向改善。
+    momentum_confirmation = close_recovered and rsi_turn
+    return pattern_confirmation or momentum_confirmation
 
 
 def _top_confirmation(
     features: SwingFeatures,
     previous: SwingFeatures | None,
+    previous_state: SwingState | None,
     config: SwingConfig,
 ) -> bool:
-    if previous is None or not _high_zone(features, config):
+    if (
+        previous is None
+        or previous_state is not SwingState.HIGH_WATCH
+        or not _high_zone(features, config)
+        or _has_doji(features)
+        or not _top_trend_allows_confirmation(features)
+    ):
         return False
-    close_retreated = features.close_price <= previous.close_price
+    close_retreated = features.close_price < previous.close_price - _THRESHOLD_EPSILON
     rsi_turn = (
         features.rsi is not None
         and previous.rsi is not None
-        and features.rsi <= previous.rsi - config.reversal_rsi_tolerance
+        and features.rsi < previous.rsi - config.reversal_rsi_tolerance
     )
-    pattern_confirmation = _has_any_pattern(features.candle_patterns, _BEARISH_PATTERNS)
-    trend_allows_momentum_only = features.trend_regime != "up"
-    return close_retreated and (pattern_confirmation or (rsi_turn and trend_allows_momentum_only))
+    # 形态路线：观察日出现方向形态，确认日收盘必须真正跌破观察日最低价。
+    pattern_confirmation = _has_any_pattern(previous.candle_patterns, _BEARISH_PATTERNS) and (
+        features.close_price < previous.low_price - _THRESHOLD_EPSILON
+    )
+    # 动量路线：不依赖某个形态，但必须同时看到价格和 RSI 的同向走弱。
+    momentum_confirmation = close_retreated and rsi_turn
+    return pattern_confirmation or momentum_confirmation
 
 
 def evaluate_swing_state(
@@ -116,8 +155,8 @@ def evaluate_swing_state(
 
     is_low = _low_zone(features, settings)
     is_high = _high_zone(features, settings)
-    bottom = _bottom_confirmation(features, previous, settings)
-    top = _top_confirmation(features, previous, settings)
+    bottom = _bottom_confirmation(features, previous, previous_state, settings)
+    top = _top_confirmation(features, previous, previous_state, settings)
 
     # 正常 OHLC 不会同时处于高低区；若数据或自定义阈值造成同时满足，宁可
     # 返回中性，避免让一个含糊的状态影响历史回放。

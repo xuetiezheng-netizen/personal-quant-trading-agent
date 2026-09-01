@@ -33,8 +33,9 @@ from trading_agent.swing.models import (
 )
 from trading_agent.swing.portfolio import Holding, PortfolioSnapshot, PortfolioStore
 from trading_agent.swing.strategy import SwingStateMachine
+from trading_agent.swing.validation import run_robustness_checks
 
-STRATEGY_VERSION = "swing-low-frequency-v1"
+STRATEGY_VERSION = "swing-low-frequency-v1.1"
 """可写入报告的策略版本；修改核心规则时应同步递增。"""
 
 # 回测不能假装交易免费。佣金与滑点是可替换的保守示例值；股票卖出税费
@@ -56,16 +57,16 @@ _CODE_PATTERN = re.compile(r"^[0-9]{6}$")
 _STATE_LABELS: dict[SwingState, str] = {
     SwingState.DATA_INSUFFICIENT: "数据不足",
     SwingState.LOW_WATCH: "低位观察",
-    SwingState.BOTTOM_CONFIRMED: "底部确认",
+    SwingState.BOTTOM_CONFIRMED: "低位反转信号",
     SwingState.NEUTRAL: "中性",
     SwingState.HIGH_WATCH: "高位观察",
-    SwingState.TOP_CONFIRMED: "顶部确认",
+    SwingState.TOP_CONFIRMED: "高位转弱信号",
 }
 _REASON_LABELS = {
     "history_or_indicator_insufficient": "历史日线或指标所需数据还不够",
     "low_price_position": "价格处在近一段时间相对偏低区域",
     "drawdown": "价格较滚动高点有明显回撤",
-    "reversal_confirmation": "出现收盘价回稳和反转形态/动能配合",
+    "reversal_confirmation": "先进入高低位观察区，随后日线出现方向性跟随",
     "reversal_not_confirmed": "已经接近低位，但反转条件尚未同时满足",
     "high_price_position": "价格处在近一段时间相对偏高区域",
     "near_rolling_high": "价格接近滚动观察区间高点",
@@ -192,14 +193,22 @@ class BacktestReport:
     core_weight: float
     costs: TransactionCosts
     buy_and_hold: PerformanceMetrics | None = None
+    static_core_cash: PerformanceMetrics | None = None
     core_tactical: PerformanceMetrics | None = None
     trade_events: int = 0
+    deferred_count: int = 0
+    robustness: Mapping[str, object] | None = None
     error: str | None = None
     report_path: str | None = None
 
     @property
     def has_performance(self) -> bool:
-        return self.status == "ok" and self.buy_and_hold is not None and self.core_tactical is not None
+        return (
+            self.status == "ok"
+            and self.buy_and_hold is not None
+            and self.static_core_cash is not None
+            and self.core_tactical is not None
+        )
 
     def as_dict(self, *, include_name: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -224,6 +233,11 @@ class BacktestReport:
                 "horizon": "weeks_to_months",
                 "core_is_unchanged": True,
                 "not_actual_return": True,
+                "warmup_excluded": True,
+                "drawdown_basis": "daily_close",
+                "zero_liquidity_action": "defer",
+                "adjusted_price_scope": "relative_rule_replay",
+                "not_portfolio_aggregate": True,
                 "costs_bps": {
                     "commission": self.costs.commission_bps,
                     "slippage": self.costs.slippage_bps,
@@ -231,8 +245,11 @@ class BacktestReport:
                 },
             },
             "buy_and_hold": _metrics_dict(self.buy_and_hold),
+            "static_core_cash": _metrics_dict(self.static_core_cash),
             "core_tactical": _metrics_dict(self.core_tactical),
             "trade_events": self.trade_events,
+            "deferred_count": self.deferred_count,
+            "robustness": dict(self.robustness) if self.robustness is not None else None,
             "report_path": self.report_path,
         }
         if include_name:
@@ -293,6 +310,10 @@ def _metrics_dict(metrics: PerformanceMetrics | None) -> dict[str, object] | Non
         "trade_count": metrics.trade_count,
         "turnover": metrics.turnover,
         "final_value": metrics.final_value,
+        "annualized_return": metrics.annualized_return,
+        "annualized_volatility": metrics.annualized_volatility,
+        "calmar_ratio": metrics.calmar_ratio,
+        "market_exposure": metrics.market_exposure,
     }
 
 
@@ -767,14 +788,24 @@ class SwingService:
                 costs=effective_costs,
                 config=holding_config,
             )
+            robustness = run_robustness_checks(
+                bars,
+                asset_type=holding.asset_type,
+                costs=effective_costs,
+                config=holding_config,
+                base_result=result,
+            )
             return BacktestReport(
                 **common,
                 status="ok",
                 start_date=result.start_date.date(),
                 end_date=result.end_date.date(),
                 buy_and_hold=result.buy_and_hold,
+                static_core_cash=result.static_core_cash,
                 core_tactical=result.core_tactical,
                 trade_events=len(result.trades),
+                deferred_count=result.deferred_count,
+                robustness=robustness.as_dict(),
             )
         except Exception:  # noqa: BLE001 - safe public result boundary
             return BacktestReport(

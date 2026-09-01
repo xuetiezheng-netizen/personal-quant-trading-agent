@@ -99,8 +99,12 @@ class SwingConfig:
             raise ValueError("持有期和冷静期不能为负")
         if not 0 <= self.low_position_threshold < self.high_position_threshold <= 1:
             raise ValueError("高低位价格区间阈值必须在 0 到 1 之间且低位小于高位")
-        if self.low_drawdown_threshold >= 0 or self.high_drawdown_threshold > 0:
-            raise ValueError("回撤阈值应为负数或零")
+        if not 0 <= self.low_rsi_threshold < self.high_rsi_threshold <= 100:
+            raise ValueError("RSI 高低位阈值必须在 0 到 100 之间且低位小于高位")
+        if self.reversal_rsi_tolerance < 0:
+            raise ValueError("RSI 反转容差不能为负")
+        if not self.low_drawdown_threshold < self.high_drawdown_threshold <= 0:
+            raise ValueError("回撤阈值必须为负数或零且低位阈值小于高位阈值")
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +224,9 @@ class EquityPoint:
     buy_and_hold_value: float
     core_tactical_value: float
     tactical_target: float
+    # 静态核心仓/现金基准：核心仓始终持有，机动仓始终留在现金。
+    # 放在已有字段之后并给默认值，兼容外部按旧字段构造 EquityPoint 的调用者。
+    static_core_cash_value: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +238,12 @@ class PerformanceMetrics:
     trade_count: int
     turnover: float
     final_value: float
+    # 以下指标均按日线观测、252 个交易日年化；短样本不足时返回有限的
+    # 0.0，而不是抛异常或生成无穷值，便于网页和报告层稳定展示。
+    annualized_return: float = 0.0
+    annualized_volatility: float = 0.0
+    calmar_ratio: float = 0.0
+    market_exposure: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,3 +258,8 @@ class BacktestResult:
     decisions: tuple[SwingDecision, ...] = field(default_factory=tuple)
     trades: tuple[TradeEvent, ...] = field(default_factory=tuple)
     equity_curve: tuple[EquityPoint, ...] = field(default_factory=tuple)
+    # 与动态核心/机动回放同一评估区间的静态基准。None 只为兼容旧版外部
+    # 构造调用；run_backtest 始终填充该字段。
+    static_core_cash: PerformanceMetrics | None = None
+    # 因下一根日线无成交量或无成交额而顺延的待执行信号次数。
+    deferred_count: int = 0

@@ -28,9 +28,9 @@
       explanation: "价格进入相对低位区域，但仍需要后续收盘数据确认。",
     },
     BOTTOM_CONFIRMED: {
-      label: "底部确认",
+      label: "低位反转信号",
       tone: "teal-strong",
-      explanation: "多个日线条件出现反转配合，只代表阶段观察信号。",
+      explanation: "先进入低位观察区，后续日线出现向上跟随；不代表底部已经被证明。",
     },
     NEUTRAL: {
       label: "中性",
@@ -43,9 +43,9 @@
       explanation: "价格进入相对高位区域，留意后续收盘数据的变化。",
     },
     TOP_CONFIRMED: {
-      label: "顶部确认",
+      label: "高位转弱信号",
       tone: "amber-strong",
-      explanation: "多个日线条件出现转弱配合，只代表阶段观察信号。",
+      explanation: "先进入高位观察区，后续日线出现向下跟随；不代表顶部已经被证明。",
     },
   };
 
@@ -526,18 +526,26 @@
       return;
     }
     const buyHold = summary.buy_and_hold || summary.buyAndHold || {};
+    const staticCoreCash = summary.static_core_cash || summary.staticCoreCash || {};
     const coreTactical = summary.core_tactical || summary.coreTactical || {};
+    const robustness = summary.robustness || {};
+    const consistency = robustness.status === "ok"
+      ? `${robustness.direction_consistent_count}/${robustness.direction_total}`
+      : "样本不足";
     const cards = [
       ["长期持有回放", formatPercent(buyHold.total_return)],
-      ["核心+机动回放", formatPercent(coreTactical.total_return)],
-      ["核心+机动最大回撤", formatPercent(coreTactical.max_drawdown)],
-      ["历史观察次数", coreTactical.trade_count == null ? "—" : String(coreTactical.trade_count)],
+      ["静态核心+现金", formatPercent(staticCoreCash.total_return)],
+      ["动态核心+机动", formatPercent(coreTactical.total_return)],
+      ["动态最大回撤", formatPercent(coreTactical.max_drawdown)],
+      ["动态年化波动", formatPercent(coreTactical.annualized_volatility)],
+      ["平均市场暴露", formatPercent(coreTactical.market_exposure)],
+      ["固定扰动方向一致", consistency],
     ];
     panel.classList.remove("hidden");
     metrics.innerHTML = cards.map(([label, value]) => `<div class="metric-card"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
     const assumptions = summary.assumptions || {};
     const ratio = assumptions.tactical_weight == null ? "可编辑" : formatPercent(assumptions.tactical_weight);
-    note.textContent = `这是相同历史区间的描述性回放，不是未来结果；机动仓模拟比例 ${ratio}，核心仓保持不动。`;
+    note.textContent = `三种口径使用相同有效区间，指标预热期不计绩效；4/4 也只表示固定扰动下方向未翻转，不证明未来有效。机动仓模拟比例 ${ratio}，核心仓保持不动。`;
   }
 
   async function refresh() {

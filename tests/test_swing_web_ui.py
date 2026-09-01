@@ -13,6 +13,7 @@ def test_primary_page_explains_scope_and_has_private_empty_state() -> None:
         "核心仓不动",
         "默认 20% 只是可编辑的历史模拟假设，不是建议配置",
         "日线中低频，数周到数月",
+        "再等待后续日线跟随",
         "无券商、无自动交易",
         "只在本机保存",
         "不会写入 GitHub",
@@ -49,10 +50,12 @@ def test_personal_api_paths_and_local_token_are_wired() -> None:
 
 
 def test_ui_uses_observation_labels_and_delete_confirmation() -> None:
-    for label in ("数据不足", "低位观察", "底部确认", "中性", "高位观察", "顶部确认"):
+    for label in ("数据不足", "低位观察", "低位反转信号", "中性", "高位观察", "高位转弱信号"):
         assert label in APP
     for label in ("更新阶段判断", "历史模拟"):
         assert label in APP
+    assert "固定扰动方向一致" in APP
+    assert "不证明未来有效" in APP
     assert "window.confirm" in APP
     assert "阶段判断不是买卖指令" in HTML
     for direct_label in (">买入<", ">卖出<", ">加仓<", ">减仓<", ">清仓<", ">下单<"):
@@ -76,3 +79,5 @@ def test_mobile_layout_prevents_long_names_and_keeps_legacy_tools_collapsed() ->
     assert "overflow-wrap: anywhere" in STYLES
     assert ".holding-title h3" in STYLES and "min-width: 0" in STYLES
     assert ".holding-grid" in STYLES
+    assert '[data-ui-action="add-holding"]' in STYLES
+    assert "white-space: nowrap" in STYLES

@@ -89,7 +89,7 @@ def render_analysis_report(result: AnalysisResult) -> str:
         "",
         f"- 标的：{result.name}（代码仅用于本机索引）",
         f"- 观察状态：{_state_heading(result)}",
-        f"- 置信度：{result.confidence}",
+        f"- 技术证据强度：{result.confidence}",
         f"- 数据截止：{_date_text(result.data_as_of)}",
         f"- 数据量：{result.bars_available} 根日线（最低要求 {result.required_bars} 根）",
         f"- 策略版本：{result.strategy_version}",
@@ -134,16 +134,78 @@ def render_analysis_report(result: AnalysisResult) -> str:
     return "\n".join(lines)
 
 
-def _metrics_lines(title: str, metrics: Any) -> list[str]:
+def _metrics_lines(title: str, metrics: Any, *, show_activity: bool = False) -> list[str]:
     if metrics is None:
         return [f"- {title}：未计算"]
-    return [
+    lines = [
         f"- {title}总收益（历史模拟）：{_percent(metrics.total_return)}",
-        f"- {title}最大回撤：{_percent(metrics.max_drawdown)}",
+        f"- {title}年化收益：{_percent(metrics.annualized_return)}",
+        f"- {title}年化波动率：{_percent(metrics.annualized_volatility)}",
+        f"- {title}最大回撤（收盘口径）：{_percent(metrics.max_drawdown)}",
+        f"- {title}Calmar：{_number(metrics.calmar_ratio, 3)}",
+        f"- {title}平均市场暴露：{_percent(metrics.market_exposure)}",
         f"- {title}最终净值（初始 1.0）：{_number(metrics.final_value, 4)}",
-        f"- {title}状态变化次数：{metrics.trade_count}",
-        f"- {title}换手比例：{_percent(metrics.turnover)}",
     ]
+    if show_activity:
+        lines.extend(
+            [
+                f"- {title}模拟变化次数：{metrics.trade_count}",
+                f"- {title}换手比例：{_percent(metrics.turnover)}",
+            ]
+        )
+    return lines
+
+
+def _robustness_lines(payload: Mapping[str, object] | None) -> list[str]:
+    """把固定敏感性检查解释成不夸大的小白版文字。"""
+
+    if payload is None:
+        return []
+    lines = [
+        "",
+        "## 固定敏感性检查（不选择最优参数）",
+        "",
+    ]
+    if payload.get("status") != "ok":
+        lines.extend(
+            [
+                "- 有效净值区间不足以切成三个独立阶段，本次不生成稳健性数字。",
+                "- 这不会改变上面的基础回放，但说明还不能检查结果是否依赖某段历史。",
+            ]
+        )
+        return lines
+
+    count = payload.get("direction_consistent_count")
+    total = payload.get("direction_total")
+    lines.extend(
+        [
+            f"- 两组固定阈值扰动和两组成本压力中，相对全程持有的收益方向与基础配置一致：{count}/{total}。",
+            "- 一致只表示这四个预设变化没有让相对收益方向翻转；即使是 4/4，也不能证明未来有效。",
+        ]
+    )
+    scenarios = payload.get("scenarios")
+    if not isinstance(scenarios, list):
+        return lines
+    labels = {
+        "phase_1": "连续阶段 1",
+        "phase_2": "连续阶段 2",
+        "phase_3": "连续阶段 3",
+        "parameter_tighten_20pct": "阈值收紧约 20%",
+        "parameter_loosen_20pct": "阈值放宽约 20%",
+        "cost_2x": "成本假设 2 倍",
+        "cost_3x": "成本假设 3 倍",
+    }
+    for raw in scenarios:
+        if not isinstance(raw, Mapping) or raw.get("status") != "ok":
+            continue
+        name = str(raw.get("scenario", "scenario"))
+        lines.append(
+            f"- {labels.get(name, name)}：动态回放 {_percent(raw.get('dynamic_return'))}，"
+            f"全程持有 {_percent(raw.get('buy_hold_return'))}，"
+            f"静态核心与现金 {_percent(raw.get('static_return'))}，"
+            f"动态收盘回撤 {_percent(raw.get('dynamic_max_drawdown'))}。"
+        )
+    return lines
 
 
 def render_backtest_report(result: BacktestReport) -> str:
@@ -168,9 +230,13 @@ def render_backtest_report(result: BacktestReport) -> str:
         "",
         "## 模拟假设",
         "",
-        "- 比较基准：全程持有同一标的的历史净值曲线。",
+        "- 比较口径一：全程持有同一标的。",
+        "- 比较口径二：核心仓保持持有，机动部分始终保留现金。",
+        "- 比较口径三：核心仓保持持有，机动部分按观察信号动态变化。",
         f"- 机动模拟比例：{result.tactical_weight:.0%}，这是可编辑的假设，不是个人实际配置；核心仓比例 {result.core_weight:.0%} 全程保持不变。",
         "- 时序规则：当天收盘形成状态，下一根日线开盘才处理模拟暴露变化。",
+        "- 预热规则：前段历史只用于把指标算完整，不计入净值和绩效。",
+        "- 流动性规则：下一根日线成交量或成交额为零时，模拟变化延后到下一根可用日线。",
         "- 频率与期限：日线、数周至数月、中低频；最短持有期和冷静期用于减少来回变化。",
         f"- 成本假设：手续费 {result.costs.commission_bps:g} bps、滑点 {result.costs.slippage_bps:g} bps、单向税费 {result.costs.sell_tax_bps:g} bps；真实费率需自行核对。",
         "",
@@ -189,16 +255,28 @@ def render_backtest_report(result: BacktestReport) -> str:
         lines.extend(["## 历史统计（仅供比较）", ""])
         lines.extend(_metrics_lines("全程持有基准", result.buy_and_hold))
         lines.append("")
-        lines.extend(_metrics_lines("核心与机动模拟", result.core_tactical))
-        lines.extend(["", f"- 模拟状态变化记录：{result.trade_events} 次。"])
+        lines.extend(_metrics_lines("静态核心与现金基准", result.static_core_cash))
+        lines.append("")
+        lines.extend(_metrics_lines("动态核心与机动模拟", result.core_tactical, show_activity=True))
+        lines.extend(
+            [
+                "",
+                f"- 实际生成的模拟变化记录：{result.trade_events} 次。",
+                f"- 因零成交量或零成交额而延后的日线：{result.deferred_count} 根。",
+            ]
+        )
+        lines.extend(_robustness_lines(result.robustness))
     lines.extend(
         [
             "",
             "## 风险声明",
             "",
             "历史回放会受到复权方式、缺失交易日、公开接口质量、成本和滑点假设影响；它只能帮助理解规则在过去如何表现。",
+            "当前最大回撤是每日收盘净值口径，不代表盘中可能经历的最大跌幅。",
+            "前复权行情用于相对规则回放，不是带分红、拆分和真实资金账的逐笔可执行收益。",
             "当前未模拟券商单笔最低佣金；机动金额较小时，历史结果可能偏乐观。",
-            "股票与不同 ETF 的交易制度可能不同，本工具不替用户确认具体产品规则，也不连接券商。",
+            "当前也未模拟涨跌停、整手单位和实际组合相关性；股票与不同 ETF 的制度需另行核对。",
+            "本工具不连接券商，也不会改变真实持仓。",
             "",
         ]
     )
