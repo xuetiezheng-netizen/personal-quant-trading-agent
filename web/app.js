@@ -222,6 +222,58 @@
     return Object.assign({}, item, { code, asset_type: assetType });
   }
 
+  const SOURCE_LABELS = Object.freeze({
+    eastmoney: "东方财富",
+    tencent: "腾讯",
+    baostock: "BaoStock",
+    tushare: "Tushare Pro",
+    failover: "自动线路",
+  });
+
+  function sourceKey(value) {
+    const key = String(value == null ? "" : value).trim().toLowerCase();
+    return Object.prototype.hasOwnProperty.call(SOURCE_LABELS, key) ? key : "";
+  }
+
+  function normaliseSourceAttempts(result) {
+    if (!result || !Array.isArray(result.source_attempts)) return [];
+    return result.source_attempts.map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const source = sourceKey(item.source);
+      if (!source) return null;
+      const rawStatus = String(item.status == null ? "" : item.status).trim().toLowerCase();
+      const status = rawStatus === "success" ? "success" : (rawStatus === "unsupported" ? "unsupported" : "failed");
+      return { source, status };
+    }).filter(Boolean);
+  }
+
+  function sourceSummary(result) {
+    const selected = sourceKey(result && result.data_source);
+    const attempts = normaliseSourceAttempts(result);
+    const successful = attempts.filter((item) => item.status === "success" && item.source !== "failover");
+    let actual = "";
+    if (attempts.length > 0) {
+      actual = successful.length > 0 ? successful[successful.length - 1].source : "";
+    } else if (selected && selected !== "failover") {
+      // Older results predate source_attempts; data_source is their only provenance.
+      actual = selected;
+    }
+    if (actual) {
+      const successIndex = attempts.findIndex((item) => item.source === actual && item.status === "success");
+      const switched = successIndex > 0 && attempts.slice(0, successIndex).some((item) => item.status !== "success");
+      return `本次来源：${SOURCE_LABELS[actual]}${switched ? "（已自动切换）" : ""}`;
+    }
+
+    const tried = [];
+    attempts.forEach((item) => {
+      if (item.source === "failover" || tried.includes(item.source)) return;
+      tried.push(item.source);
+    });
+    return tried.length > 0
+      ? `自动线路均不可用（尝试过：${tried.map((source) => SOURCE_LABELS[source]).join("、")}）`
+      : "自动线路均不可用";
+  }
+
   function resultFor(holding) {
     const key = holdingKey(holding);
     const matches = pageState.results.filter((item) => holdingKey(item) === key);
@@ -275,6 +327,7 @@
         <div class="phase-row"><span class="phase-caption">当前阶段</span>${stateMarkup(result)}</div>
         <p class="phase-explanation">${meta.explanation}</p>
         <p class="phase-date">数据截至：${escapeHtml(dateFromResult(result))}</p>
+        <p class="phase-date">${escapeHtml(result ? sourceSummary(result) : "等待线路结果")}</p>
         <div class="holding-actions">
           <button class="button button-secondary button-small" type="button" data-swing-action="analyze" data-code="${escapeHtml(holding.code)}" data-asset-type="${escapeHtml(holding.asset_type)}">更新阶段判断</button>
           <button class="button button-quiet button-small" type="button" data-swing-action="backtest" data-code="${escapeHtml(holding.code)}" data-asset-type="${escapeHtml(holding.asset_type)}">历史模拟</button>
@@ -305,6 +358,7 @@
         <div class="result-card-heading"><div><strong>${escapeHtml((holding && holding.name) || result.name || result.code)}</strong><small>${escapeHtml(result.code)} · ${displayAssetType(result.asset_type)}</small></div>${stateMarkup(result)}</div>
         <p>${meta.explanation}</p>
         <small class="phase-date">数据截至：${escapeHtml(dateFromResult(result))} · 仅供观察</small>
+        <small class="phase-date">${escapeHtml(sourceSummary(result))}</small>
       </article>`;
     }).join("");
   }

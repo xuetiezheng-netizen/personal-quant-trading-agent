@@ -63,6 +63,29 @@ def test_ui_uses_observation_labels_and_delete_confirmation() -> None:
         assert direct_label not in APP
 
 
+def test_swing_cards_show_public_source_labels_and_automatic_switch() -> None:
+    for mapping in (
+        'eastmoney: "东方财富"',
+        'tencent: "腾讯"',
+        'baostock: "BaoStock"',
+        'tushare: "Tushare Pro"',
+        'failover: "自动线路"',
+    ):
+        assert mapping in APP
+    for phrase in ("本次来源：", "已自动切换", "自动线路均不可用", "尝试过："):
+        assert phrase in APP
+    # The same source summary is rendered on both the holding and result cards.
+    assert APP.count("sourceSummary(result)") >= 2
+
+
+def test_swing_source_display_supports_legacy_results_and_hides_provider_details() -> None:
+    assert "Array.isArray(result.source_attempts)" in APP
+    assert "Older results predate source_attempts" in APP
+    assert "data_source" in APP
+    # reason_code is intentionally never copied into the UI-safe attempt object.
+    assert "reason_code" not in APP
+
+
 def test_task_busy_state_disables_personal_actions_and_handles_errors_in_chinese() -> None:
     assert "function setTaskBusy(busy)" in APP
     assert "function waitForTask(taskId)" in APP

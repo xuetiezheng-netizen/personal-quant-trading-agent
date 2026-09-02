@@ -8,10 +8,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections.abc import Callable, Sequence
 from datetime import date, datetime
 from pathlib import Path
+
+from dotenv import dotenv_values
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -69,8 +72,51 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _read_repo_tushare_token(repo_root: Path) -> str:
+    """Read only ``TUSHARE_TOKEN`` from the explicitly selected repo ``.env``.
+
+    The command-line entry point intentionally does not call ``load_dotenv``:
+    that would inject unrelated values (for example model credentials) into
+    the process.  ``dotenv_values`` parses the file without mutating the
+    environment, and the whitelist below keeps the optional data credential
+    isolated from every other setting.
+    """
+
+    try:
+        values = dotenv_values(repo_root / ".env")
+    except (OSError, UnicodeError, ValueError):
+        return ""
+    token = values.get("TUSHARE_TOKEN")
+    return token.strip() if isinstance(token, str) else ""
+
+
 def _build_service(repo_root: Path) -> SwingService:
-    return SwingService(repo_root)
+    """Build the default service with a narrowly scoped optional token.
+
+    A non-empty process environment value wins.  When it is absent/blank, a
+    token from this exact repository's ``.env`` is temporarily exposed only
+    while ``SwingService`` constructs its default provider.  It is restored
+    immediately afterwards so the entry point does not leave secrets in the
+    caller's environment.
+    """
+
+    process_token = os.environ.get("TUSHARE_TOKEN", "")
+    if isinstance(process_token, str) and process_token.strip():
+        return SwingService(repo_root)
+
+    repo_token = _read_repo_tushare_token(repo_root)
+    if not repo_token:
+        return SwingService(repo_root)
+
+    previous = os.environ.get("TUSHARE_TOKEN")
+    os.environ["TUSHARE_TOKEN"] = repo_token
+    try:
+        return SwingService(repo_root)
+    finally:
+        if previous is None:
+            os.environ.pop("TUSHARE_TOKEN", None)
+        else:
+            os.environ["TUSHARE_TOKEN"] = previous
 
 
 def _display_mode(mode: str) -> str:

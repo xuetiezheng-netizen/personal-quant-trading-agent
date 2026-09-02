@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from trading_agent.domain.models import DailyBar
+from trading_agent.swing.data import HistoryBar, HistoryData
+from trading_agent.swing.history_providers import FailoverHistoryProvider
 from trading_agent.swing.models import SwingConfig, SwingState
 from trading_agent.swing.portfolio import Holding, PortfolioStore
 from trading_agent.swing.reports import SwingReportError, write_private_report
@@ -39,6 +41,50 @@ def _bars(count: int) -> tuple[DailyBar, ...]:
     return tuple(result)
 
 
+def _history_data(
+    source: str,
+    bars: tuple[DailyBar, ...],
+    *,
+    code: str = "999999",
+    asset_type: str = "etf",
+    exchange: str = "sz",
+    source_attempts: tuple[dict[str, str], ...] = (),
+) -> HistoryData:
+    history_bars = tuple(
+        HistoryBar(
+            date=bar.trade_date.date(),
+            open=bar.open_price,
+            high=bar.high_price,
+            low=bar.low_price,
+            close=bar.close_price,
+            volume=bar.volume,
+            amount=bar.turnover_amount,
+        )
+        for bar in bars
+    )
+    return HistoryData(
+        code=code,
+        asset_type=asset_type,  # type: ignore[arg-type]
+        exchange=exchange,  # type: ignore[arg-type]
+        secid=f"0.{code}",
+        bars=history_bars,
+        source=source,
+        source_url="https://example.invalid/history",
+        adjustment="qfq",
+        requested_as_of=datetime(2026, 9, 1, 16, tzinfo=SHANGHAI),
+        requested_start=history_bars[0].date,
+        requested_end=history_bars[-1].date,
+        completed_through=history_bars[-1].date,
+        fetched_at=datetime(2026, 9, 1, 16, tzinfo=SHANGHAI),
+        raw_bar_count=len(history_bars),
+        dropped_bar_count=0,
+        complete=True,
+        volume_unit="shares",
+        amount_unit="CNY",
+        source_attempts=source_attempts,  # type: ignore[arg-type]
+    )
+
+
 class FakeProvider:
     name = "fake_public"
 
@@ -51,13 +97,38 @@ class FakeProvider:
         return self.bars
 
 
-def _service(tmp_path: Path, bars: tuple[DailyBar, ...]) -> SwingService:
+class _FailingHistoryProvider:
+    def __init__(self, name: str, error: BaseException) -> None:
+        self.name = name
+        self.error = error
+
+    def fetch_daily_bars(self, code: str, **kwargs: object) -> object:
+        raise self.error
+
+
+class _FixedHistoryProvider:
+    def __init__(self, name: str, result: HistoryData) -> None:
+        self.name = name
+        self.result = result
+
+    def fetch_daily_bars(self, code: str, **kwargs: object) -> HistoryData:
+        return self.result
+
+
+def _service(
+    tmp_path: Path,
+    bars: tuple[DailyBar, ...],
+    *,
+    provider: object | None = None,
+    code: str = "999999",
+    asset_type: str = "etf",
+) -> SwingService:
     store = PortfolioStore(tmp_path / "data" / "private" / "holdings.json")
     store.add_holding(
         {
-            "code": "999999",
+            "code": code,
             "name": "虚构资产",
-            "asset_type": "etf",
+            "asset_type": asset_type,
             "quantity": 100,
             "avg_cost_cny": 10.0,
         },
@@ -78,10 +149,154 @@ def _service(tmp_path: Path, bars: tuple[DailyBar, ...]) -> SwingService:
     return SwingService(
         tmp_path,
         portfolio_store=store,
-        provider=FakeProvider(bars),
+        provider=provider or FakeProvider(bars),
         config=config,
         now=lambda: datetime(2026, 9, 1, 16, tzinfo=SHANGHAI),
     )
+
+
+def _empty_service(tmp_path: Path) -> SwingService:
+    store = PortfolioStore(tmp_path / "data" / "private" / "holdings.json")
+    return SwingService(
+        tmp_path,
+        portfolio_store=store,
+        now=lambda: datetime(2026, 9, 1, 16, tzinfo=SHANGHAI),
+    )
+
+
+def test_default_provider_order_without_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+
+    service = _empty_service(tmp_path)
+
+    assert [provider.name for provider in service.provider.providers] == [
+        "eastmoney",
+        "tencent",
+        "baostock",
+    ]
+    assert "tushare" not in repr(service.provider).lower()
+
+
+def test_default_provider_adds_tushare_only_for_non_empty_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    token = "secret-token"
+    monkeypatch.setenv("TUSHARE_TOKEN", token)
+
+    service = _empty_service(tmp_path)
+
+    assert [provider.name for provider in service.provider.providers] == [
+        "eastmoney",
+        "tushare",
+        "tencent",
+        "baostock",
+    ]
+    assert token not in repr(service.provider)
+
+
+def test_explicit_provider_injection_is_preserved(tmp_path: Path) -> None:
+    provider = FakeProvider(_bars(2))
+
+    service = _service(tmp_path, _bars(2), provider=provider)
+
+    assert service.provider is provider
+
+
+def test_unapproved_attempt_reason_is_not_persisted(tmp_path: Path) -> None:
+    malicious_reason = "provider_error_token"
+    history = _history_data(
+        "tushare",
+        _bars(150),
+        source_attempts=(
+            {
+                "source": "tushare",
+                "status": "failed",
+                "reason_code": malicious_reason,
+            },
+        ),
+    )
+    service = _service(
+        tmp_path,
+        _bars(150),
+        provider=_FixedHistoryProvider("tushare", history),
+    )
+
+    result = service.analyze("999999")
+    latest = json.loads(service.latest_results_path.read_text(encoding="utf-8"))
+    report = (tmp_path / result.report_path).read_text(encoding="utf-8")  # type: ignore[arg-type]
+
+    assert result.source_attempts == ()
+    assert result.as_dict()["source_attempts"] == []
+    assert latest["results"][0]["source_attempts"] == []
+    assert malicious_reason not in repr(result)
+    assert malicious_reason not in report
+    assert "Tushare Pro" in report
+
+
+def test_provider_switch_attempts_reach_result_latest_and_report(tmp_path: Path) -> None:
+    bars = _bars(150)
+    primary = _FailingHistoryProvider("eastmoney", RuntimeError("secret-token-and-private-data"))
+    secondary = _FixedHistoryProvider(
+        "tencent", _history_data("tencent", bars, code="510300", exchange="sh")
+    )
+    provider = FailoverHistoryProvider([primary, secondary])
+    service = _service(tmp_path, bars, provider=provider, code="510300")
+
+    result = service.analyze("510300")
+    payload = result.as_dict()
+    latest = json.loads(service.latest_results_path.read_text(encoding="utf-8"))
+    report = (tmp_path / result.report_path).read_text(encoding="utf-8")  # type: ignore[arg-type]
+
+    assert result.status == "ok"
+    assert result.data_source == "tencent"
+    assert payload["source_attempts"] == [
+        {"source": "eastmoney", "status": "failed", "reason_code": "provider_error"},
+        {"source": "tencent", "status": "success", "reason_code": "ok"},
+    ]
+    assert latest["results"][0]["source_attempts"] == payload["source_attempts"]
+    assert "腾讯" in report
+    assert "已自动切换" in report
+    assert "provider_error" not in report
+    assert "secret-token" not in repr(result)
+
+
+def test_all_failures_are_safe_and_expose_only_public_attempts(tmp_path: Path) -> None:
+    token = "very-secret-token"
+    provider = FailoverHistoryProvider(
+        [
+            _FailingHistoryProvider("eastmoney", RuntimeError(f"upstream token={token}")),
+            _FailingHistoryProvider("unknown-private-source", RuntimeError("private error")),
+            _FailingHistoryProvider("tencent", RuntimeError("temporary failure")),
+        ]
+    )
+    service = _service(tmp_path, _bars(150), provider=provider, code="510300")
+
+    analysis = service.analyze("510300")
+    backtest = service.backtest("510300")
+    latest = json.loads(service.latest_results_path.read_text(encoding="utf-8"))
+    analysis_report = (tmp_path / analysis.report_path).read_text(encoding="utf-8")  # type: ignore[arg-type]
+    backtest_report = (tmp_path / backtest.report_path).read_text(encoding="utf-8")  # type: ignore[arg-type]
+
+    expected = [
+        {"source": "eastmoney", "status": "failed", "reason_code": "provider_error"},
+        {
+            "source": "unknown-private-source",
+            "status": "failed",
+            "reason_code": "provider_error",
+        },
+        {"source": "tencent", "status": "failed", "reason_code": "provider_error"},
+    ]
+    assert analysis.status == "error"
+    assert backtest.status == "error"
+    assert analysis.source_attempts == tuple(expected)
+    assert backtest.source_attempts == tuple(expected)
+    assert all(item["source_attempts"] == expected for item in latest["results"])
+    for text in (repr(analysis), repr(backtest), analysis_report, backtest_report):
+        assert token not in text
+    for text in (analysis_report, backtest_report):
+        assert "provider_error" not in text
+        assert "unknown-private-source" not in text
+        assert "自动线路均不可用（尝试过：东方财富、腾讯）" in text
 
 
 def test_analyze_writes_private_beginner_report_and_latest_contract(tmp_path: Path) -> None:

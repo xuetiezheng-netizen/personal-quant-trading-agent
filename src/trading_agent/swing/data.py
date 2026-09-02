@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -38,6 +39,46 @@ class HistoryDataError(RuntimeError):
 
 class HistoryFetchError(HistoryDataError):
     """公开行情接口在有限重试后仍不可用。"""
+
+
+@dataclass(frozen=True, slots=True)
+class HistorySourceAttempt:
+    """一次公开行情来源尝试的安全摘要。
+
+    该结构只允许来源、状态和公开原因码三类字段，专门供 failover 结果向
+    上层展示。它不保存 URL、异常文本、认证信息或任何私有数据。
+    """
+
+    source: str
+    status: Literal["success", "failed", "unsupported"]
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        source = str(self.source).strip().lower()
+        reason_code = str(self.reason_code).strip().lower()
+        if not source or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", source):
+            raise ValueError("source must be a short public identifier")
+        if self.status not in {"success", "failed", "unsupported"}:
+            raise ValueError("status must be success, failed, or unsupported")
+        if not reason_code or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason_code):
+            raise ValueError("reason_code must be a short public code")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "reason_code", reason_code)
+
+    @property
+    def public_reason_code(self) -> str:
+        """兼容调用方对“公开原因码”的命名。"""
+
+        return self.reason_code
+
+    def as_dict(self) -> dict[str, str]:
+        """返回不含敏感字段的可序列化摘要。"""
+
+        return {
+            "source": self.source,
+            "status": self.status,
+            "reason_code": self.reason_code,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +152,8 @@ class HistoryData:
     complete: bool = True
     volume_unit: str = "source_native"
     amount_unit: str = "CNY"
+    # 新增字段放在所有旧字段之后，保持按位置构造 HistoryData 的兼容性。
+    source_attempts: tuple[HistorySourceAttempt, ...] = ()
 
     @property
     def data_as_of(self) -> date:
@@ -129,6 +172,18 @@ class HistoryData:
     @property
     def bar_count(self) -> int:
         return len(self.bars)
+
+    @property
+    def attempts(self) -> tuple[HistorySourceAttempt, ...]:
+        """``source_attempts`` 的简短兼容别名。"""
+
+        return self.source_attempts
+
+    @property
+    def provider_attempts(self) -> tuple[HistorySourceAttempt, ...]:
+        """来源尝试元数据的语义化兼容别名。"""
+
+        return self.source_attempts
 
 
 class EastmoneyHistoryProvider:

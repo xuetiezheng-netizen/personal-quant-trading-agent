@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -21,8 +22,12 @@ from typing import Any, Protocol
 
 from trading_agent.domain.models import DailyBar
 from trading_agent.swing.backtest import run_backtest
-from trading_agent.swing.data import EastmoneyHistoryProvider, HistoryData
+from trading_agent.swing.data import HistoryData
 from trading_agent.swing.features import calculate_swing_features, prepare_bars
+from trading_agent.swing.history_providers import (
+    HistoryFailoverError,
+    build_default_history_provider,
+)
 from trading_agent.swing.models import (
     BacktestResult,
     PerformanceMetrics,
@@ -52,6 +57,32 @@ PRIVATE_RELATIVE_PATH = Path("data") / "private"
 REPORTS_RELATIVE_PATH = PRIVATE_RELATIVE_PATH / "reports"
 LATEST_RESULTS_RELATIVE_PATH = PRIVATE_RELATIVE_PATH / "latest-results.json"
 RUN_SUMMARY_RELATIVE_PATH = PRIVATE_RELATIVE_PATH / "run-summary.json"
+
+SourceAttempt = dict[str, str]
+SourceAttempts = tuple[SourceAttempt, ...]
+_ATTEMPT_SOURCE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+_ATTEMPT_REASON_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_ATTEMPT_STATUSES = {"success", "failed", "unsupported"}
+_ATTEMPT_REASON_CODES = {
+    "ok",
+    "provider_error",
+    "invalid_result",
+    "unsupported_asset",
+    "missing_dependency",
+    "empty_result",
+    "missing_field",
+    "invalid_response",
+    "request_error",
+    "query_error",
+}
+_PUBLIC_DATA_SOURCES = {
+    "eastmoney",
+    "tushare",
+    "tencent",
+    "baostock",
+    "failover",
+    "public_daily",
+}
 
 _CODE_PATTERN = re.compile(r"^[0-9]{6}$")
 _STATE_LABELS: dict[SwingState, str] = {
@@ -134,6 +165,7 @@ class AnalysisResult:
     features: Mapping[str, object] = None  # type: ignore[assignment]
     error: str | None = None
     report_path: str | None = None
+    source_attempts: SourceAttempts = ()
 
     def __post_init__(self) -> None:
         if self.features is None:
@@ -163,6 +195,7 @@ class AnalysisResult:
             "unused_information": list(self.unused_information),
             "features": dict(self.features),
             "report_path": self.report_path,
+            "source_attempts": _source_attempts_payload(self.source_attempts),
         }
         if include_name:
             payload["name"] = self.name
@@ -200,6 +233,7 @@ class BacktestReport:
     robustness: Mapping[str, object] | None = None
     error: str | None = None
     report_path: str | None = None
+    source_attempts: SourceAttempts = ()
 
     @property
     def has_performance(self) -> bool:
@@ -251,6 +285,7 @@ class BacktestReport:
             "deferred_count": self.deferred_count,
             "robustness": dict(self.robustness) if self.robustness is not None else None,
             "report_path": self.report_path,
+            "source_attempts": _source_attempts_payload(self.source_attempts),
         }
         if include_name:
             payload["name"] = self.name
@@ -295,6 +330,7 @@ class _FetchedHistory:
     data_source: str
     adjustment: str
     completed_through: date | None
+    source_attempts: SourceAttempts = ()
 
 
 def _date_or_datetime_text(value: date | datetime) -> str:
@@ -397,10 +433,100 @@ def _history_bar_to_daily(bar: Any) -> DailyBar:
     )
 
 
+def _normalise_source_attempts(value: object) -> SourceAttempts:
+    """Keep only the small public attempt contract from a provider result."""
+
+    if value is None:
+        return ()
+    if isinstance(value, Mapping):
+        candidates: Sequence[object] = (value,)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        candidates = value
+    else:
+        return ()
+
+    safe: list[SourceAttempt] = []
+    for item in candidates:
+        candidate: object = item
+        as_dict = getattr(item, "as_dict", None)
+        if callable(as_dict):
+            try:
+                candidate = as_dict()
+            except Exception:  # noqa: BLE001 - metadata must not break the result
+                candidate = None
+        if candidate is None:
+            continue
+        if isinstance(candidate, Mapping):
+            source = candidate.get("source")
+            status = candidate.get("status")
+            reason_code = candidate.get("reason_code", candidate.get("public_reason_code"))
+        else:
+            source = getattr(candidate, "source", None)
+            status = getattr(candidate, "status", None)
+            reason_code = getattr(candidate, "reason_code", getattr(candidate, "public_reason_code", None))
+        if not all(isinstance(field, str) for field in (source, status, reason_code)):
+            continue
+        normalized_source = source.strip().lower()
+        normalized_status = status.strip().lower()
+        normalized_reason = reason_code.strip().lower()
+        if (
+            _ATTEMPT_SOURCE_PATTERN.fullmatch(normalized_source)
+            and normalized_status in _ATTEMPT_STATUSES
+            and _ATTEMPT_REASON_PATTERN.fullmatch(normalized_reason)
+            and normalized_reason in _ATTEMPT_REASON_CODES
+            and not any(
+                marker in normalized_reason
+                for marker in ("token", "http", "url", "exception", "trace")
+            )
+        ):
+            safe.append(
+                {
+                    "source": normalized_source,
+                    "status": normalized_status,
+                    "reason_code": normalized_reason,
+                }
+            )
+    return tuple(safe)
+
+
+def _source_attempts_payload(value: object) -> list[dict[str, str]]:
+    return [dict(attempt) for attempt in _normalise_source_attempts(value)]
+
+
+def _safe_data_source(value: object) -> str:
+    source = str(value).strip().lower()
+    return source if source in _PUBLIC_DATA_SOURCES else "public_daily"
+
+
+def _attempts_from_failure(exc: BaseException) -> SourceAttempts:
+    if isinstance(exc, HistoryFailoverError):
+        return _normalise_source_attempts(getattr(exc, "attempts", ()))
+    return ()
+
+
+def _build_default_history_provider():
+    """Build default public history routes, adding Tushare only with a token."""
+
+    token = os.environ.get("TUSHARE_TOKEN", "")
+    additional: list[object] = []
+    if isinstance(token, str) and token.strip():
+        # Import the optional provider only after an explicit non-empty token is
+        # present. The provider itself also lazy-loads the optional tushare SDK.
+        from trading_agent.swing.tushare_history import TushareHistoryProvider
+
+        additional.append(TushareHistoryProvider(token=token.strip()))
+    return build_default_history_provider(additional)
+
+
 def _normalise_history(raw: Any, provider: DailyHistoryProvider) -> _FetchedHistory:
     metadata = raw if isinstance(raw, HistoryData) else None
-    source = str(getattr(raw, "source", getattr(provider, "name", "public_daily")))
+    source = _safe_data_source(
+        getattr(raw, "source", getattr(provider, "name", "public_daily"))
+    )
     adjustment = str(getattr(raw, "adjustment", "qfq"))
+    source_attempts = _normalise_source_attempts(
+        getattr(raw, "source_attempts", getattr(provider, "source_attempts", ()))
+    )
     raw_bars: Any = getattr(raw, "bars", raw)
     if isinstance(raw_bars, (str, bytes)) or not isinstance(raw_bars, Iterable):
         raise TypeError("公开日线返回格式不受支持")
@@ -413,6 +539,7 @@ def _normalise_history(raw: Any, provider: DailyHistoryProvider) -> _FetchedHist
         data_source=source,
         adjustment=adjustment,
         completed_through=completed,
+        source_attempts=source_attempts,
     )
 
 
@@ -479,7 +606,7 @@ class SwingService:
             if store_path.parent != self.private_root or store_path.name != "holdings.json":
                 raise SwingServiceError("持仓文件必须固定在 data/private/holdings.json")
         self.portfolio_store = portfolio_store
-        self.provider = provider or EastmoneyHistoryProvider()
+        self.provider = provider if provider is not None else _build_default_history_provider()
         self.config = config or SwingConfig()
         self.costs = costs
         self._now = now or (lambda: datetime.now(SHANGHAI))
@@ -700,8 +827,10 @@ class SwingService:
                 adjustment=history.adjustment,
                 reasons=reasons,
                 features=_feature_dict(decision),
+                source_attempts=history.source_attempts,
             )
         except Exception as exc:  # noqa: BLE001 - safe public result boundary
+            failure_attempts = _attempts_from_failure(exc)
             if isinstance(exc, SwingDataInsufficientError):
                 return AnalysisResult(
                     code=holding.code,
@@ -716,10 +845,11 @@ class SwingService:
                     data_as_of=None,
                     bars_available=0,
                     required_bars=self.config.min_history_bars,
-                    data_source=getattr(self.provider, "name", "public_daily"),
+                    data_source=_safe_data_source(getattr(self.provider, "name", "public_daily")),
                     adjustment="qfq",
                     reasons=("没有可用的完整收盘日线",),
                     error=_generic_data_error(),
+                    source_attempts=failure_attempts,
                 )
             return AnalysisResult(
                 code=holding.code,
@@ -734,10 +864,11 @@ class SwingService:
                 data_as_of=None,
                 bars_available=0,
                 required_bars=self.config.min_history_bars,
-                data_source=getattr(self.provider, "name", "public_daily"),
+                data_source=_safe_data_source(getattr(self.provider, "name", "public_daily")),
                 adjustment="qfq",
                 reasons=("公开日线未通过安全校验",),
                 error=_generic_data_error(),
+                source_attempts=failure_attempts,
             )
 
     def _backtest_holding(self, holding: Holding, observed_at: date | datetime) -> BacktestReport:
@@ -773,6 +904,7 @@ class SwingService:
                 "costs": effective_costs,
                 "state": state,
                 "state_label": state_label,
+                "source_attempts": history.source_attempts,
             }
             if len(bars) < holding_config.min_history_bars:
                 return BacktestReport(
@@ -807,7 +939,7 @@ class SwingService:
                 deferred_count=result.deferred_count,
                 robustness=robustness.as_dict(),
             )
-        except Exception:  # noqa: BLE001 - safe public result boundary
+        except Exception as exc:  # noqa: BLE001 - safe public result boundary
             return BacktestReport(
                 code=holding.code,
                 name=holding.name,
@@ -821,12 +953,13 @@ class SwingService:
                 end_date=None,
                 bars_available=0,
                 required_bars=self.config.min_history_bars,
-                data_source=getattr(self.provider, "name", "public_daily"),
+                data_source=_safe_data_source(getattr(self.provider, "name", "public_daily")),
                 adjustment="qfq",
                 tactical_weight=holding.tactical_ratio,
                 core_weight=1.0 - holding.tactical_ratio,
                 costs=effective_costs,
                 error=_generic_data_error(),
+                source_attempts=_attempts_from_failure(exc),
             )
 
     def _render_analysis(self, result: AnalysisResult) -> str:
@@ -885,6 +1018,10 @@ class SwingService:
                             "state": item.get("state", "DATA_INSUFFICIENT"),
                             "data_as_of": item.get("data_as_of"),
                             "report_path": self._safe_report_reference(item.get("report_path")),
+                            "data_source": _safe_data_source(item.get("data_source")),
+                            "source_attempts": _source_attempts_payload(
+                                item.get("source_attempts", ())
+                            ),
                         }
                         if mode == "backtest":
                             for summary_key in (
@@ -912,6 +1049,7 @@ class SwingService:
                     "mode",
                     "status",
                     "state",
+                    "data_source",
                     "data_as_of",
                     "report_path",
                     "error",
@@ -922,9 +1060,14 @@ class SwingService:
                     "trade_events",
                     "deferred_count",
                     "robustness",
+                    "source_attempts",
                 )
                 if key in payload
             }
+            payload["source_attempts"] = _source_attempts_payload(
+                payload.get("source_attempts", ())
+            )
+            payload["data_source"] = _safe_data_source(payload.get("data_source"))
             merged[(str(payload["code"]), str(payload["asset_type"]), str(payload["mode"]))] = payload
         document = {
             "schema_version": 1,

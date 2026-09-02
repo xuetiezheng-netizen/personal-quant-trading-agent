@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -105,3 +106,115 @@ def test_parser_accepts_beginner_modes() -> None:
     assert build_parser().parse_args(["analyze"]).mode == "analyze"
     assert build_parser().parse_args(["backtest"]).mode == "backtest"
     assert build_parser().parse_args(["all"]).mode == "all"
+
+
+class _CaptureService:
+    def __init__(self, _repo_root: Path, captured: list[dict[str, str | None]]) -> None:
+        captured.append(
+            {
+                "tushare": os.environ.get("TUSHARE_TOKEN"),
+                "deepseek": os.environ.get("DEEPSEEK_API_KEY"),
+            }
+        )
+
+
+def test_default_service_prefers_process_token_and_does_not_read_other_dotenv_secrets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from scripts import run_swing
+
+    monkeypatch.setenv("TUSHARE_TOKEN", "process-token")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "TUSHARE_TOKEN=repo-token\nDEEPSEEK_API_KEY=dotenv-model-secret\n",
+        encoding="utf-8",
+    )
+    captured: list[dict[str, str | None]] = []
+    monkeypatch.setattr(
+        run_swing,
+        "SwingService",
+        lambda root: _CaptureService(root, captured),
+    )
+
+    run_swing._build_service(tmp_path)
+
+    assert captured == [{"tushare": "process-token", "deepseek": None}]
+    assert os.environ["TUSHARE_TOKEN"] == "process-token"
+    assert os.environ.get("DEEPSEEK_API_KEY") is None
+
+
+def test_default_service_falls_back_to_repo_dotenv_and_restores_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from scripts import run_swing
+
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "TUSHARE_TOKEN=repo-token\nDEEPSEEK_API_KEY=dotenv-model-secret\n",
+        encoding="utf-8",
+    )
+    captured: list[dict[str, str | None]] = []
+    monkeypatch.setattr(
+        run_swing,
+        "SwingService",
+        lambda root: _CaptureService(root, captured),
+    )
+
+    run_swing._build_service(tmp_path)
+
+    assert captured == [{"tushare": "repo-token", "deepseek": None}]
+    assert os.environ.get("TUSHARE_TOKEN") is None
+    assert os.environ.get("DEEPSEEK_API_KEY") is None
+
+
+def test_blank_tokens_do_not_enable_optional_provider_or_print_secrets(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from scripts import run_swing
+
+    monkeypatch.setenv("TUSHARE_TOKEN", "   ")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "TUSHARE_TOKEN=   \nDEEPSEEK_API_KEY=dotenv-model-secret\n",
+        encoding="utf-8",
+    )
+    captured: list[dict[str, str | None]] = []
+    monkeypatch.setattr(
+        run_swing,
+        "SwingService",
+        lambda root: _CaptureService(root, captured),
+    )
+
+    run_swing._build_service(tmp_path)
+
+    assert captured == [{"tushare": "   ", "deepseek": None}]
+    assert os.environ["TUSHARE_TOKEN"] == "   "
+    output = capsys.readouterr()
+    assert "dotenv-model-secret" not in output.out + output.err
+
+
+def test_service_factory_injection_does_not_load_repo_dotenv(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from scripts import run_swing
+
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "TUSHARE_TOKEN=repo-token\nDEEPSEEK_API_KEY=dotenv-model-secret\n",
+        encoding="utf-8",
+    )
+    service = _service(tmp_path)
+
+    exit_code = run_swing.main(
+        ["analyze", "--repo-root", str(tmp_path)],
+        service_factory=lambda _root: service,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert os.environ.get("TUSHARE_TOKEN") is None
+    assert os.environ.get("DEEPSEEK_API_KEY") is None
+    assert "repo-token" not in captured.out + captured.err
+    assert "dotenv-model-secret" not in captured.out + captured.err

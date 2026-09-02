@@ -23,6 +23,13 @@ if TYPE_CHECKING:
 
 _CODE_PATTERN = re.compile(r"^[0-9]{6}$")
 _PRIVATE_NAME = "private"
+_SOURCE_LABELS = {
+    "eastmoney": "东方财富",
+    "tushare": "Tushare Pro",
+    "tencent": "腾讯",
+    "baostock": "BaoStock",
+    "failover": "自动线路",
+}
 
 
 class SwingReportError(RuntimeError):
@@ -71,6 +78,43 @@ def _state_heading(result: AnalysisResult | BacktestReport) -> str:
     return f"{result.state_label}（{result.state.value}）"
 
 
+def _source_summary(result: AnalysisResult | BacktestReport) -> str:
+    """Render source status without exposing provider internals or URLs."""
+
+    source = str(getattr(result, "data_source", "")).strip().lower()
+    label = _SOURCE_LABELS.get(source, "公开行情")
+    raw_attempts = getattr(result, "source_attempts", ())
+    if isinstance(raw_attempts, Mapping):
+        attempts = (raw_attempts,)
+    elif isinstance(raw_attempts, (list, tuple)):
+        attempts = raw_attempts
+    else:
+        attempts = ()
+    statuses: list[str] = []
+    attempted_sources: list[str] = []
+    for item in attempts:
+        if isinstance(item, Mapping):
+            raw_source = item.get("source", "")
+            raw_status = item.get("status", "")
+        else:
+            raw_source = getattr(item, "source", "")
+            raw_status = getattr(item, "status", "")
+        source_key = str(raw_source).strip().lower()
+        statuses.append(str(raw_status).strip().lower())
+        if source_key in _SOURCE_LABELS and source_key != "failover" and source_key not in attempted_sources:
+            attempted_sources.append(source_key)
+    if getattr(result, "status", None) == "error" and (
+        not statuses or all(status != "success" for status in statuses)
+    ):
+        if attempted_sources:
+            labels = "、".join(_SOURCE_LABELS[source] for source in attempted_sources)
+            return f"自动线路均不可用（尝试过：{labels}）"
+        return "自动线路均不可用"
+    if statuses and statuses[-1] == "success" and len(statuses) > 1:
+        return f"{label}（已自动切换）"
+    return label
+
+
 def render_analysis_report(result: AnalysisResult) -> str:
     """渲染单持仓观察报告；不输出个人数量、成本等非必要字段。"""
 
@@ -93,7 +137,7 @@ def render_analysis_report(result: AnalysisResult) -> str:
         f"- 数据截止：{_date_text(result.data_as_of)}",
         f"- 数据量：{result.bars_available} 根日线（最低要求 {result.required_bars} 根）",
         f"- 策略版本：{result.strategy_version}",
-        f"- 数据源：{result.data_source}；复权方式：{result.adjustment}",
+        f"- 数据源：{_source_summary(result)}；复权方式：{result.adjustment}",
         "",
         "## 用小白能理解的话解释",
         "",
@@ -226,7 +270,7 @@ def render_backtest_report(result: BacktestReport) -> str:
         f"- 数据截止：{_date_text(result.data_as_of)}",
         f"- 数据量：{result.bars_available} 根日线（最低要求 {result.required_bars} 根）",
         f"- 策略版本：{result.strategy_version}",
-        f"- 数据源：{result.data_source}；复权方式：{result.adjustment}",
+        f"- 数据源：{_source_summary(result)}；复权方式：{result.adjustment}",
         "",
         "## 模拟假设",
         "",
