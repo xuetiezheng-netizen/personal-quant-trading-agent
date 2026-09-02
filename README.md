@@ -139,12 +139,13 @@ A 股全市场
 
 持仓波段助手请求历史日线时，会按下面的固定顺序尝试公开来源：
 
-`东方财富 →（存在非空 TUSHARE_TOKEN 时）Tushare Pro → 腾讯（AKShare）→ BaoStock`
+`东方财富 →（存在非空 TUSHARE_TOKEN 时）Tushare Pro → AData（同花顺 ETF）→ 腾讯（AKShare）→ BaoStock`
 
 这条链只服务于已经录入的单只股票或 ETF，不会把不同来源的 K 线按日期拼在一起。某个来源返回的整段数据只有在代码、资产类型、交易所、复权方式、日期顺序与范围、OHLCV 数值和单位都通过校验后才会被接受；失败或不完整就继续尝试下一条，并在报告中说明最终来源和是否发生切换。
 
-- 股票：东方财富失败后，可在满足条件时依次尝试 Tushare Pro、腾讯和 BaoStock。
-- ETF：无 `TUSHARE_TOKEN` 时只有东方财富；有非空 Token 时可尝试 Tushare Pro。腾讯和 BaoStock 当前明确不支持 ETF，因此不会被当作 ETF 的可用备份。
+- 股票：东方财富失败后，可在满足条件时依次尝试 Tushare Pro、腾讯和 BaoStock；AData 对股票快速返回“不支持”，不会发出网络请求。
+- ETF：无 `TUSHARE_TOKEN` 时依次尝试东方财富、AData（同花顺）；有非空 Token 时先尝试 Tushare Pro。腾讯和 BaoStock 当前明确不支持 ETF，因此不会被当作 ETF 的可用备份。
+- AData 仅作为 ETF 备用线路，采用其 2.9.5 版本的同花顺公开日线接口；接口免费但非正式、无 SLA，可能限流、改版或暂时不可用，不构成长期数据质量保证。
 - `complete` 只表示收到的行通过了结构和字段校验，不证明源数据没有缺少交易日。免费公开接口没有 SLA，可能延迟、限流、改版或短时不可用；Tushare 还需要单独核实账号、积分和接口权限，不能仅凭安装成功视为可用。
 - 发送给行情源的请求只包含公开代码、股票/ETF 类型、交易所映射、日期范围和复权方式，不包含本地持仓数量、成本、盈亏或备注。个人持仓仍只保存在本机 `data/private/`，绝不提交到 GitHub。
 
@@ -172,6 +173,12 @@ cp .env.example .env
 
 ```bash
 pip install -e '.[tushare]'
+```
+
+需要启用 AData 的 ETF 备用线路时，再单独安装可选依赖：
+
+```bash
+pip install -e '.[adata]'
 ```
 
 启动 API：
@@ -212,7 +219,7 @@ DEEPSEEK_API_KEY=your_key_here
 TUSHARE_TOKEN=
 ```
 
-程序只在这个环境变量为非空时把 Tushare Pro 加入持仓历史日线的备选线路；不会把 Token 写入报告、日志、网页或请求展示。股票日线和 ETF 日线所需的 Tushare 接口、复权因子权限以及账号积分需要你单独真实验证；没有 Token 时，ETF 不会自动切换到腾讯或 BaoStock。
+程序只在这个环境变量为非空时把 Tushare Pro 加入持仓历史日线的备选线路；不会把 Token 写入报告、日志、网页或请求展示。股票日线和 ETF 日线所需的 Tushare 接口、复权因子权限以及账号积分需要你单独真实验证；没有 Token 时，ETF 会继续尝试 AData（同花顺）备用线路。
 
 ## 如何使用
 
@@ -257,7 +264,7 @@ T 字线和明显不对称的十字会被排除。所有阈值集中在 [`config
 | 类别 | 当前来源 | 使用方式 |
 | --- | --- | --- |
 | 全市场行情 / 收盘快照 | 新浪、东方财富 | 基础扫描；使用最近一个完整收盘日 |
-| 持仓波段历史日线 | 东方财富 → Tushare Pro（可选）→ 腾讯（AKShare）→ BaoStock | 已录入股票或 ETF 的阶段判断与历史模拟；按资产类型限制可用来源 |
+| 持仓波段历史日线 | 东方财富 → Tushare Pro（可选）→ AData（仅 ETF）→ 腾讯（仅股票）→ BaoStock（仅股票） | 已录入股票或 ETF 的阶段判断与历史模拟；按资产类型限制可用来源 |
 | 公司公告 | 巨潮资讯 CNINFO | 只查询已经入围的候选股 |
 | 个股新闻 | 东方财富 / AKShare | 只查询已经入围的候选股 |
 | 补充新闻 | Tushare，可选 | 取决于账号接口权限 |

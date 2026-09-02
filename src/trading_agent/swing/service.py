@@ -74,10 +74,12 @@ _ATTEMPT_REASON_CODES = {
     "invalid_response",
     "request_error",
     "query_error",
+    "timeout",
 }
 _PUBLIC_DATA_SOURCES = {
     "eastmoney",
     "tushare",
+    "adata",
     "tencent",
     "baostock",
     "failover",

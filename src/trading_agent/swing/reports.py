@@ -26,6 +26,7 @@ _PRIVATE_NAME = "private"
 _SOURCE_LABELS = {
     "eastmoney": "东方财富",
     "tushare": "Tushare Pro",
+    "adata": "AData（同花顺）",
     "tencent": "腾讯",
     "baostock": "BaoStock",
     "failover": "自动线路",

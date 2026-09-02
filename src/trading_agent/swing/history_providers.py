@@ -7,14 +7,17 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import re
 import socket
+import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from itertools import pairwise
+from pathlib import Path
 from threading import RLock
 from typing import ClassVar, Protocol, runtime_checkable
 
@@ -43,6 +46,7 @@ _DEFAULT_LIMIT = 1300
 # sockets or threads that do not use this lock.
 _BAOSTOCK_LOCK = RLock()
 _DEFAULT_BAOSTOCK_TIMEOUT_SECONDS = 20.0
+_DEFAULT_ADATA_TIMEOUT_SECONDS = 20.0
 _REASON_CODES = {
     "ok",
     "provider_error",
@@ -54,6 +58,7 @@ _REASON_CODES = {
     "invalid_response",
     "request_error",
     "query_error",
+    "timeout",
 }
 
 
@@ -108,6 +113,22 @@ class _HistoryDependencyError(HistoryDataError):
     """Optional provider dependency is not installed."""
 
     reason_code = "missing_dependency"
+
+
+class ADataHistoryError(HistoryDataError):
+    """AData ETF history was unavailable or failed the local safety checks.
+
+    The exception keeps the provider identity and a bounded public reason code
+    so direct callers can distinguish this optional route from other sources
+    without receiving vendor response text.
+    """
+
+    source = "adata"
+
+    def __init__(self, reason_code: str = "provider_error") -> None:
+        self.public_reason_code = _safe_reason_code(reason_code, fallback="provider_error")
+        self.reason_code = self.public_reason_code
+        super().__init__(f"AData ETF history failed ({self.public_reason_code})")
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +221,172 @@ class FailoverHistoryProvider:
         raise HistoryFailoverError(tuple(attempts))
 
     fetch_daily_history = fetch_daily_bars
+
+
+class ADataEtfHistoryProvider:
+    """通过 AData 的同花顺 ETF 日线接口获取 ETF 历史日线。
+
+    AData 是可选依赖，且只在实际 ETF 请求时导入。它不是股票线路：股票
+    请求在任何导入或网络动作前直接返回 ``unsupported``。同花顺日线接口
+    的路径约定为 ``00`` 不复权、``01`` 前复权、``02`` 后复权；AData 公共
+    方法只暴露前复权，因此 ``none``/``hfq`` 走同一个 AData THS 客户端的
+    原始日线请求，并在本地解析为统一字段。
+
+    ``frame_fetcher`` 仅供测试和离线验证注入，调用参数模拟 AData ETF 日线
+    入口：``fund_code``、``k_type``、``start_date``、``end_date``、
+    ``adjustment`` 与 ``path``。
+    """
+
+    name = "adata"
+    source_url = "https://github.com/1nchaos/adata"
+    _FIELDS = ("trade_date", "open", "high", "low", "close", "volume", "amount")
+    _ADJUSTMENT_PATH: ClassVar[dict[str, str]] = {
+        "none": "00",
+        "qfq": "01",
+        "hfq": "02",
+    }
+
+    def __init__(
+        self,
+        *,
+        limit: int = _DEFAULT_LIMIT,
+        timeout_seconds: float = _DEFAULT_ADATA_TIMEOUT_SECONDS,
+        frame_fetcher: Callable[..., object] | None = None,
+        fetcher: Callable[..., object] | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+            or timeout_seconds > 30.0
+        ):
+            raise ValueError("timeout_seconds must be finite, positive, and at most 30 seconds")
+        if frame_fetcher is not None and fetcher is not None:
+            raise ValueError("provide only one frame fetcher")
+        self._limit = limit
+        self.timeout_seconds = float(timeout_seconds)
+        self._frame_fetcher = frame_fetcher or fetcher
+        self._now = now or (lambda: datetime.now(_SHANGHAI_TZ))
+
+    def fetch_daily_bars(
+        self,
+        code: str,
+        *,
+        asset_type: AssetType,
+        as_of: date | datetime | None = None,
+        start: date | datetime | None = None,
+        end: date | datetime | None = None,
+        adjustment: str = "qfq",
+        exchange: Exchange | None = None,
+    ) -> HistoryData:
+        # This check must precede request normalization and optional imports: a
+        # stock must never cause an AData network request or dependency lookup.
+        if _normalize_asset_type(asset_type) != "etf":
+            raise HistoryUnsupportedError()
+        request = _history_request(
+            code,
+            asset_type=asset_type,
+            as_of=as_of,
+            start=start,
+            end=end,
+            adjustment=adjustment,
+            exchange=exchange,
+            default_limit=self._limit,
+        )
+        try:
+            frame = self._fetch_frame(request)
+            records = _records_from_frame(frame, fields=self._FIELDS)
+            raw_bars, dropped = _parse_adata_raw_bars(
+                records,
+                fields=self._FIELDS,
+                request=request,
+            )
+            if not raw_bars:
+                raise ADataHistoryError("empty_result")
+            return _history_from_raw_bars(
+                raw_bars,
+                dropped=dropped,
+                raw_bar_count=len(records),
+                request=request,
+                source=self.name,
+                source_url=self._source_url(request),
+                now=self._now,
+            )
+        except ADataHistoryError:
+            raise
+        except _HistoryDependencyError:
+            raise ADataHistoryError("missing_dependency") from None
+        except HistoryDataError as exc:
+            raise ADataHistoryError(_history_error_reason(exc)) from None
+        except Exception:  # noqa: BLE001 - vendor boundary is deliberately bounded
+            raise ADataHistoryError("provider_error") from None
+
+    fetch_daily_history = fetch_daily_bars
+
+    def _fetch_frame(self, request: _HistoryRequest) -> object:
+        path = self._ADJUSTMENT_PATH[request.adjustment]
+        kwargs = {
+            "fund_code": request.code,
+            "k_type": 1,
+            "start_date": request.start.strftime("%Y-%m-%d"),
+            "end_date": request.end.strftime("%Y-%m-%d"),
+            "adjustment": request.adjustment,
+            "path": path,
+        }
+        if self._frame_fetcher is not None:
+            return self._frame_fetcher(**kwargs)
+        worker = Path(__file__).with_name("_adata_worker.py")
+        command = [
+            sys.executable,
+            str(worker),
+            "--code",
+            request.code,
+            "--start",
+            request.start.isoformat(),
+            "--end",
+            request.cutoff.isoformat(),
+            "--adjustment",
+            request.adjustment,
+        ]
+        run_kwargs: dict[str, object] = {
+            "shell": False,
+            "capture_output": True,
+            "text": True,
+            "timeout": self.timeout_seconds,
+        }
+        if sys.platform == "win32":
+            # Keep the helper invisible when the desktop app invokes it on
+            # Windows; no console window should appear for a data request.
+            run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            completed = subprocess.run(command, check=False, **run_kwargs)
+        except subprocess.TimeoutExpired:
+            # subprocess.run terminates and waits for the child on timeout.
+            raise ADataHistoryError("timeout") from None
+        except OSError:
+            raise ADataHistoryError("provider_error") from None
+        if completed.returncode != 0:
+            raise ADataHistoryError("provider_error")
+        try:
+            payload = json.loads(completed.stdout or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ADataHistoryError("invalid_response") from None
+        if not isinstance(payload, Mapping):
+            raise ADataHistoryError("invalid_response")
+        if payload.get("ok") is not True:
+            reason = payload.get("reason_code")
+            raise ADataHistoryError(_safe_reason_code(reason, fallback="provider_error"))
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            raise ADataHistoryError("invalid_response")
+        return rows
+
+    def _source_url(self, request: _HistoryRequest) -> str:
+        path = self._ADJUSTMENT_PATH[request.adjustment]
+        return f"http://d.10jqka.com.cn/v6/line/hs_{request.code}/{path}/last36000.js"
 
 
 class TencentHistoryProvider:
@@ -404,11 +591,11 @@ class BaoStockHistoryProvider:
 def build_default_history_provider(
     additional_providers: Sequence[DailyHistoryProvider] = (),
 ) -> FailoverHistoryProvider:
-    """构造默认线路：东方财富、未来插槽、腾讯、BaoStock。"""
+    """构造默认线路：东方财富、可选 Tushare、AData ETF、腾讯、BaoStock。"""
 
     providers: list[DailyHistoryProvider] = [EastmoneyHistoryProvider()]
     providers.extend(tuple(additional_providers))
-    providers.extend((TencentHistoryProvider(), BaoStockHistoryProvider()))
+    providers.extend((ADataEtfHistoryProvider(), TencentHistoryProvider(), BaoStockHistoryProvider()))
     return FailoverHistoryProvider(providers)
 
 
@@ -527,6 +714,27 @@ def _history_from_records(
         volume_scale=1.0,
         amount_scale=1.0,
     )
+    return _history_from_raw_bars(
+        raw_bars,
+        dropped=dropped,
+        raw_bar_count=len(records),
+        request=request,
+        source=source,
+        source_url=source_url,
+        now=now,
+    )
+
+
+def _history_from_raw_bars(
+    raw_bars: Sequence[_RawBar],
+    *,
+    dropped: int,
+    raw_bar_count: int,
+    request: _HistoryRequest,
+    source: str,
+    source_url: str,
+    now: Callable[[], datetime],
+) -> HistoryData:
     if not raw_bars:
         raise HistoryDataError("history result is empty")
     bars: list[HistoryBar] = []
@@ -563,12 +771,74 @@ def _history_from_records(
         requested_end=request.end,
         completed_through=bars[-1].date,
         fetched_at=now(),
-        raw_bar_count=len(records),
+        raw_bar_count=raw_bar_count,
         dropped_bar_count=dropped,
         complete=True,
         volume_unit="shares",
         amount_unit="CNY",
     )
+
+
+def _parse_adata_raw_bars(
+    records: Sequence[object],
+    *,
+    fields: Sequence[str],
+    request: _HistoryRequest,
+) -> tuple[tuple[_RawBar, ...], int]:
+    """Parse AData rows while dropping malformed/out-of-range rows safely.
+
+    AData's upstream parser may return ``None``, ``--`` or other non-numeric
+    values for individual rows. One bad row should not discard an otherwise
+    usable daily history, but conflicting duplicate dates remain unsafe and
+    reject the provider result.
+    """
+
+    selected: dict[date, _RawBar] = {}
+    dropped = 0
+    for row in records:
+        try:
+            row_date = _parse_date(_record_value(row, ("date", "trade_date"), fields))
+        except HistoryDataError:
+            dropped += 1
+            continue
+        if row_date < request.start or row_date > request.end or row_date > request.cutoff:
+            dropped += 1
+            continue
+        try:
+            raw = _RawBar(
+                date=row_date,
+                open=_number(_record_value(row, ("open",), fields)),
+                high=_number(_record_value(row, ("high",), fields)),
+                low=_number(_record_value(row, ("low",), fields)),
+                close=_number(_record_value(row, ("close",), fields)),
+                volume=_number(_record_value(row, ("volume", "vol"), fields)),
+                amount=_number(_record_value(row, ("amount",), fields)),
+            )
+        except HistoryDataError:
+            dropped += 1
+            continue
+        previous = selected.get(row_date)
+        if previous is not None:
+            if previous != raw:
+                raise ADataHistoryError("invalid_result")
+            dropped += 1
+            continue
+        selected[row_date] = raw
+    return tuple(selected[day] for day in sorted(selected)), dropped
+
+
+def _history_error_reason(exc: HistoryDataError) -> str:
+    reason = getattr(exc, "reason_code", None)
+    if reason is not None:
+        return _safe_reason_code(reason, fallback="invalid_result")
+    message = str(exc).lower()
+    if "missing" in message:
+        return "missing_field"
+    if "empty" in message:
+        return "empty_result"
+    if "response" in message:
+        return "invalid_response"
+    return "invalid_result"
 
 
 def _parse_raw_bars(
@@ -807,6 +1077,8 @@ def _exception_reason(exc: Exception) -> str:
 
 
 __all__ = [
+    "ADataEtfHistoryProvider",
+    "ADataHistoryError",
     "BaoStockHistoryProvider",
     "DailyHistoryProvider",
     "FailoverHistoryProvider",

@@ -171,6 +171,7 @@ def test_default_provider_order_without_token(monkeypatch: pytest.MonkeyPatch, t
 
     assert [provider.name for provider in service.provider.providers] == [
         "eastmoney",
+        "adata",
         "tencent",
         "baostock",
     ]
@@ -188,6 +189,7 @@ def test_default_provider_adds_tushare_only_for_non_empty_token(
     assert [provider.name for provider in service.provider.providers] == [
         "eastmoney",
         "tushare",
+        "adata",
         "tencent",
         "baostock",
     ]
@@ -258,6 +260,24 @@ def test_provider_switch_attempts_reach_result_latest_and_report(tmp_path: Path)
     assert "已自动切换" in report
     assert "provider_error" not in report
     assert "secret-token" not in repr(result)
+
+
+def test_adata_source_is_rendered_in_beginner_report(tmp_path: Path) -> None:
+    bars = _bars(150)
+    history = _history_data("adata", bars)
+    service = _service(
+        tmp_path,
+        bars,
+        provider=_FixedHistoryProvider("adata", history),
+    )
+
+    result = service.analyze("999999")
+
+    assert result.data_source == "adata"
+    assert result.source_attempts == ()
+    assert result.report_path is not None
+    report = (tmp_path / result.report_path).read_text(encoding="utf-8")
+    assert "AData（同花顺）" in report
 
 
 def test_all_failures_are_safe_and_expose_only_public_attempts(tmp_path: Path) -> None:
