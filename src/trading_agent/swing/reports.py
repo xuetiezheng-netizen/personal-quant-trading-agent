@@ -31,6 +31,12 @@ _SOURCE_LABELS = {
     "baostock": "BaoStock",
     "failover": "自动线路",
 }
+_TREND_LABELS = {
+    "up": "上升",
+    "down": "下降",
+    "sideways": "震荡",
+    "unknown": "未知",
+}
 
 
 class SwingReportError(RuntimeError):
@@ -79,6 +85,151 @@ def _state_heading(result: AnalysisResult | BacktestReport) -> str:
     return f"{result.state_label}（{result.state.value}）"
 
 
+def _trend_label(value: object) -> str:
+    """Return the user-facing Chinese trend label for current or legacy data."""
+
+    text = str(value).strip() if value is not None else ""
+    if text in _TREND_LABELS.values():
+        return text
+    return _TREND_LABELS.get(text.casefold(), "未取得")
+
+
+def _value_text(value: object) -> str:
+    """Render nested explanation values without leaking NaN/undefined text."""
+
+    if value is None:
+        return "未取得"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _number(value)
+    if isinstance(value, Mapping):
+        return "；".join(f"{key}={_value_text(item)}" for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return "、".join(_value_text(item) for item in value) or "未取得"
+    text = str(value).strip()
+    return text if text and text.casefold() not in {"nan", "undefined", "none"} else "未取得"
+
+
+def _condition_lines(conditions: object, *, indent: str = "- ") -> list[str]:
+    if not isinstance(conditions, (list, tuple)):
+        return [f"{indent}条件明细未提供。"]
+    lines: list[str] = []
+    for item in conditions:
+        if not isinstance(item, Mapping):
+            continue
+        label = _value_text(item.get("label"))
+        actual = _value_text(item.get("actual"))
+        threshold = _value_text(item.get("threshold"))
+        passed = (
+            "通过"
+            if item.get("pass") is True
+            else "未通过"
+            if item.get("pass") is False
+            else "未评估"
+        )
+        lines.append(f"{indent}{label}：当前 {actual}；阈值 {threshold}；{passed}。")
+    return lines or [f"{indent}条件明细未提供。"]
+
+
+def _render_analysis_explanation(explanation: object) -> list[str]:
+    """Render the backend explanation object for the private Markdown report."""
+
+    if not isinstance(explanation, Mapping):
+        return ["", "## 分析过程与依据", "", "- 完整分析解释未提供，以上结论不应脱离指标自行解读。"]
+
+    lines: list[str] = ["", "## 分析过程与依据", ""]
+    flow = explanation.get("analysis_flow")
+    if isinstance(flow, (list, tuple)) and flow:
+        lines.append("### 分析流程")
+        lines.extend(f"{index}. {_value_text(item)}" for index, item in enumerate(flow, start=1))
+        lines.append("")
+
+    for key, title in (("low_watch", "低位观察三项条件"), ("high_watch", "高位观察三项条件")):
+        group = explanation.get(key)
+        lines.append(f"### {title}")
+        if isinstance(group, Mapping):
+            group_pass = (
+                "未评估"
+                if group.get("evaluated") is False
+                else "全部通过"
+                if group.get("pass") is True
+                else "未全部通过"
+            )
+            lines.append(f"- 组内结果：{group_pass}")
+            if group.get("evaluated") is False:
+                lines.append("- 有效日线不足，低位/高位条件未评估。")
+            else:
+                lines.extend(_condition_lines(group.get("conditions")))
+        else:
+            lines.append("- 条件明细未提供。")
+        lines.append("")
+
+    trend = explanation.get("trend_environment")
+    if isinstance(trend, Mapping):
+        lines.append("### 趋势环境")
+        lines.append(f"- 当前：{_trend_label(trend.get('label') or trend.get('value'))}。")
+        lines.append(f"- 实际指标：{_value_text(trend.get('actual'))}。")
+        lines.append(f"- 规则：{_value_text(trend.get('threshold'))}")
+        lines.append(f"- 作用：{_value_text(trend.get('explanation'))}")
+        lines.append("")
+
+    confirmation = explanation.get("confirmation_path")
+    if isinstance(confirmation, Mapping):
+        lines.append("### 确认路径")
+        previous = confirmation.get("previous_state")
+        if isinstance(previous, Mapping):
+            lines.append(f"- 前一日状态：{_value_text(previous.get('label'))}。")
+        for key, title in (("bottom", "低位确认"), ("top", "高位确认")):
+            group = confirmation.get(key)
+            if not isinstance(group, Mapping):
+                continue
+            lines.append(f"- {title}：{'通过' if group.get('pass') is True else '未通过'}。")
+            lines.extend(_condition_lines(group.get("eligible_conditions"), indent="  - "))
+            routes = group.get("routes")
+            if isinstance(routes, (list, tuple)):
+                for route in routes:
+                    if isinstance(route, Mapping):
+                        lines.append(
+                            f"  - {_value_text(route.get('label'))}：当前 {_value_text(route.get('actual'))}；"
+                            f"阈值 {_value_text(route.get('threshold'))}；"
+                            f"{'通过' if route.get('pass') is True else '未通过'}。"
+                        )
+        lines.append("")
+
+    conclusion = explanation.get("conclusion")
+    if isinstance(conclusion, Mapping):
+        lines.extend(
+            [
+                "### 为什么是这个结论",
+                f"- 当前状态：{_value_text(conclusion.get('state_label'))}。",
+                f"- 综合原因：{_value_text(conclusion.get('why'))}",
+                f"- 为什么不是低位：{_value_text(conclusion.get('why_not_low'))}",
+                f"- 为什么不是高位：{_value_text(conclusion.get('why_not_high'))}",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "### 研究动作建议",
+            f"- {_value_text(explanation.get('research_recommendation', explanation.get('recommendation')))}",
+            f"- 下一次重点观察：{_value_text(explanation.get('next_observation'))}",
+            "",
+            "### 模型边界",
+        ]
+    )
+    boundary = explanation.get("model_boundary")
+    if isinstance(boundary, Mapping):
+        lines.append(f"- {_value_text(boundary.get('text'))}")
+        lines.append(f"- 严格失效规则：{_value_text(boundary.get('strict_invalidation_rule'))}")
+        if boundary.get("not_a_trade_instruction") is not None:
+            lines.append(f"- {_value_text(boundary.get('not_a_trade_instruction'))}")
+    else:
+        lines.append("- 模型边界未提供。")
+    return lines
+
+
 def _source_summary(result: AnalysisResult | BacktestReport) -> str:
     """Render source status without exposing provider internals or URLs."""
 
@@ -116,7 +267,9 @@ def _source_summary(result: AnalysisResult | BacktestReport) -> str:
     return label
 
 
-def render_analysis_report(result: AnalysisResult) -> str:
+def render_analysis_report(
+    result: AnalysisResult, *, generated_at: datetime | None = None
+) -> str:
     """渲染单持仓观察报告；不输出个人数量、成本等非必要字段。"""
 
     feature = result.features
@@ -135,6 +288,7 @@ def render_analysis_report(result: AnalysisResult) -> str:
         f"- 标的：{result.name}（代码仅用于本机索引）",
         f"- 观察状态：{_state_heading(result)}",
         f"- 技术证据强度：{result.confidence}",
+        f"- 结果生成：{_date_text(generated_at or getattr(result, 'generated_at', None) or result.as_of)}",
         f"- 数据截止：{_date_text(result.data_as_of)}",
         f"- 数据量：{result.bars_available} 根日线（最低要求 {result.required_bars} 根）",
         f"- 策略版本：{result.strategy_version}",
@@ -151,7 +305,7 @@ def render_analysis_report(result: AnalysisResult) -> str:
     lines.extend(f"- {reason}" for reason in reasons)
     lines.extend(
         [
-            f"- 趋势环境：{feature.get('trend_regime', '未取得')}",
+            f"- 趋势环境：{_trend_label(feature.get('trend_regime'))}",
             f"- 区间位置：{_number(feature.get('price_position'))}（0 接近区间低端，1 接近区间高端）",
             f"- 相对回撤：{_percent(feature.get('drawdown'))}",
             f"- RSI 动能：{_number(feature.get('rsi'), 2)}（只作辅助，不单独使用）",
@@ -164,6 +318,7 @@ def render_analysis_report(result: AnalysisResult) -> str:
         ]
     )
     lines.extend(f"- {item}" for item in unused)
+    lines.extend(_render_analysis_explanation(getattr(result, "analysis_explanation", None)))
     if result.error:
         lines.extend(["", "## 数据边界", "", f"- {result.error}"])
     lines.extend(
@@ -222,10 +377,23 @@ def _robustness_lines(payload: Mapping[str, object] | None) -> list[str]:
 
     count = payload.get("direction_consistent_count")
     total = payload.get("direction_total")
+    if not (
+        isinstance(count, int)
+        and not isinstance(count, bool)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+    ):
+        lines.extend(
+            [
+                "- 稳健性数字未提供或字段不完整，本次不生成稳健性数字。",
+                "- 这不会改变上面的基础回放，但说明还不能检查结果是否依赖某段历史。",
+            ]
+        )
+        return lines
     lines.extend(
         [
             f"- 两组固定阈值扰动和两组成本压力中，相对全程持有的收益方向与基础配置一致：{count}/{total}。",
-            "- 一致只表示这四个预设变化没有让相对收益方向翻转；即使是 4/4，也不能证明未来有效。",
+            "- 一致只表示这四个预设变化没有让相对收益方向翻转；即使全部一致，也不能证明未来有效。",
         ]
     )
     scenarios = payload.get("scenarios")
@@ -251,6 +419,86 @@ def _robustness_lines(payload: Mapping[str, object] | None) -> list[str]:
             f"动态收盘回撤 {_percent(raw.get('dynamic_max_drawdown'))}。"
         )
     return lines
+
+
+def _comparison_text(dynamic: Any, baseline: Any, *, metric: str) -> str:
+    if dynamic is None or baseline is None:
+        return "未提供足够字段，无法比较。"
+    dynamic_value = getattr(dynamic, metric, None)
+    baseline_value = getattr(baseline, metric, None)
+    if not isinstance(dynamic_value, (int, float)) or not isinstance(baseline_value, (int, float)):
+        return "未提供足够字段，无法比较。"
+    if not math.isfinite(float(dynamic_value)) or not math.isfinite(float(baseline_value)):
+        return "未提供足够字段，无法比较。"
+    delta = float(dynamic_value) - float(baseline_value)
+    if abs(delta) < 1e-12:
+        return "与全程持有基准基本相同。"
+    if metric == "max_drawdown":
+        return (
+            f"动态口径回撤较小（{_percent(dynamic_value)} 对 {_percent(baseline_value)}），方向上改善。"
+            if delta > 0
+            else f"动态口径回撤更深（{_percent(dynamic_value)} 对 {_percent(baseline_value)}），方向上恶化。"
+        )
+    return (
+        f"动态口径收益更高（{_percent(dynamic_value)} 对 {_percent(baseline_value)}）。"
+        if delta > 0
+        else f"动态口径收益更低（{_percent(dynamic_value)} 对 {_percent(baseline_value)}）。"
+    )
+
+
+def _backtest_explanation_lines(result: BacktestReport) -> list[str]:
+    """Explain the existing replay fields without adding a new performance claim."""
+
+    if result.status != "ok" or not result.has_performance:
+        return [
+            "",
+            "## 模拟过程与结论",
+            "",
+            "- 本次没有足够的有效统计字段，未生成收益、回撤或稳健性比较。",
+            "- 已知假设仍是：当天收盘形成状态，下一根日线开盘处理；缺失字段不补造结论。",
+        ]
+    robustness = result.robustness if isinstance(result.robustness, Mapping) else None
+    consistent = robustness.get("direction_consistent_count") if robustness else None
+    total = robustness.get("direction_total") if robustness else None
+    has_robustness_counts = (
+        isinstance(consistent, int)
+        and not isinstance(consistent, bool)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+    )
+    if robustness is not None and robustness.get("status") == "ok" and has_robustness_counts:
+        robustness_text = (
+            f"固定扰动方向一致 {consistent}/{total}。"
+        )
+    else:
+        robustness_text = "稳健性数字未提供或样本不足。"
+    return [
+        "",
+        "## 模拟过程与结论",
+        "",
+        (
+            f"- 模拟区间：{_date_text(result.start_date)} 至 {_date_text(result.end_date)}；"
+            f"机动仓比例 {result.tactical_weight:.0%}，核心仓比例 {result.core_weight:.0%}。"
+        ),
+        (
+            "- 执行假设：当天收盘形成状态，下一根日线开盘处理机动仓暴露变化；"
+            f"成本假设为手续费 {_number(result.costs.commission_bps, 2)} bps、"
+            f"滑点 {_number(result.costs.slippage_bps, 2)} bps、"
+            f"单向税费 {_number(result.costs.sell_tax_bps, 2)} bps。"
+        ),
+        "- 三种口径：全程持有、核心仓加现金、核心仓加动态机动；核心仓在三种口径中均保持长期持有。",
+        f"- 收益比较：{_comparison_text(result.core_tactical, result.buy_and_hold, metric='total_return')}",
+        f"- 回撤比较：{_comparison_text(result.core_tactical, result.buy_and_hold, metric='max_drawdown')}",
+        (
+            f"- 活动度：动态口径变化 {result.trade_events} 次，指标换手 "
+            f"{_percent(result.core_tactical.turnover)}，因流动性顺延 "
+            f"{result.deferred_count} 次；{robustness_text}"
+        ),
+        (
+            "- 为什么不能外推未来：历史回放只重演过去区间的固定规则和成本假设，"
+            "无法覆盖未来行情、成交限制、接口缺行、盘中波动和参数失效；它不证明未来有效。"
+        ),
+    ]
 
 
 def render_backtest_report(result: BacktestReport) -> str:
@@ -310,6 +558,7 @@ def render_backtest_report(result: BacktestReport) -> str:
                 f"- 因零成交量或零成交额而延后的日线：{result.deferred_count} 根。",
             ]
         )
+        lines.extend(_backtest_explanation_lines(result))
         lines.extend(_robustness_lines(result.robustness))
     lines.extend(
         [

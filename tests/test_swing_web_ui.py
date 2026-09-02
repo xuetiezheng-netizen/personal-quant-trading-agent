@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -69,10 +71,11 @@ def test_swing_cards_show_public_source_labels_and_automatic_switch() -> None:
         'tencent: "腾讯"',
         'baostock: "BaoStock"',
         'tushare: "Tushare Pro"',
+        'adata: "AData（同花顺）"',
         'failover: "自动线路"',
     ):
         assert mapping in APP
-    for phrase in ("本次来源：", "已自动切换", "自动线路均不可用", "尝试过："):
+    for phrase in ("本次来源：", "已自动切换", "本次未取得有效日线", "尝试过："):
         assert phrase in APP
     # The same source summary is rendered on both the holding and result cards.
     assert APP.count("sourceSummary(result)") >= 2
@@ -82,6 +85,7 @@ def test_swing_source_display_supports_legacy_results_and_hides_provider_details
     assert "Array.isArray(result.source_attempts)" in APP
     assert "Older results predate source_attempts" in APP
     assert "data_source" in APP
+    assert "data_source is authoritative" in APP
     # reason_code is intentionally never copied into the UI-safe attempt object.
     assert "reason_code" not in APP
 
@@ -94,6 +98,213 @@ def test_task_busy_state_disables_personal_actions_and_handles_errors_in_chinese
     assert "本机访问令牌无效" in APP
     assert "无法连接本地服务" in APP
     assert "可用的收盘日线数据不足" in APP
+    assert "本次更新失败，页面保留上次结果" in APP
+
+
+def test_web_helpers_runtime_handle_sources_stale_results_and_missing_values() -> None:
+    script = textwrap.dedent(
+        """
+        const assert = require("assert");
+        const fs = require("fs");
+        const vm = require("vm");
+        const source = fs.readFileSync(process.argv[1], "utf8");
+        const marker = "\\n  bindEvents();";
+        const cut = source.lastIndexOf(marker);
+        assert(cut > 0);
+        const instrumented = `${source.slice(0, cut)}
+          globalThis.__swingTest = {
+            sourceSummary,
+            lastUpdateNotice,
+            renderAnalysisDetails,
+            formatPercent,
+            finiteMetric,
+            simulationMetric,
+            renderSimulationExplanation,
+            detailKey,
+            rerenderWithOpenDetails,
+          };
+        })();`;
+        const context = { window: { __LOCAL_TOKEN__: "" }, document: {} };
+        vm.runInNewContext(instrumented, context, { filename: "web/app.js" });
+        const {
+          sourceSummary,
+          lastUpdateNotice,
+          renderAnalysisDetails,
+          formatPercent,
+          finiteMetric,
+          simulationMetric,
+          renderSimulationExplanation,
+          detailKey,
+          rerenderWithOpenDetails,
+          } = context.__swingTest;
+
+        assert.strictEqual(formatPercent(null), "未提供");
+        assert.strictEqual(formatPercent(undefined), "未提供");
+        assert.strictEqual(formatPercent(""), "未提供");
+        assert.strictEqual(finiteMetric(null), null);
+        assert.strictEqual(finiteMetric(undefined), null);
+        assert.strictEqual(finiteMetric(""), null);
+        assert.strictEqual(simulationMetric(null), "未提供");
+
+        const switched = {
+          status: "ok",
+          data_source: "adata",
+          data_as_of: "2025-05-30",
+          bars_available: 150,
+          source_attempts: [
+            { source: "eastmoney", status: "failed" },
+            { source: "adata", status: "success" },
+          ],
+        };
+        assert.strictEqual(
+          sourceSummary(switched),
+          "本次来源：AData（同花顺）（自动切换成功；此前东方财富失败）"
+        );
+
+        const allFailed = {
+          status: "error",
+          data_source: "failover",
+          bars_available: 0,
+          source_attempts: [
+            { source: "eastmoney", status: "failed" },
+            { source: "adata", status: "failed" },
+          ],
+        };
+        assert.strictEqual(
+          sourceSummary(allFailed),
+          "本次未取得有效日线（尝试过：东方财富、AData（同花顺））"
+        );
+
+        const stale = {
+          status: "ok",
+          state: "NEUTRAL",
+          data_source: "adata",
+          data_as_of: "2025-05-30",
+          generated_at: "2026-09-01T16:00:00+08:00",
+          last_update_attempt: {
+            status: "error",
+            generated_at: "2026-09-02T16:00:00+08:00",
+          },
+        };
+        const staleMarkup = lastUpdateNotice(stale);
+        assert(staleMarkup.includes("本次更新失败，以下为上次成功结果"));
+        assert(staleMarkup.includes("生成时间 2026-09-01T16:00:00+08:00"));
+        assert(staleMarkup.includes("数据截止 2025-05-30"));
+
+        const missingMarkup = renderAnalysisDetails({
+          state: "NEUTRAL",
+          analysis_explanation: {
+            analysis_flow: [],
+            low_watch: { evaluated: false, pass: false, conditions: [] },
+            high_watch: { evaluated: false, pass: false, conditions: [] },
+            trend_environment: {},
+            confirmation_path: {},
+            conclusion: {},
+            model_boundary: {},
+            indicator_snapshot: { rsi: null },
+          },
+        });
+        assert(missingMarkup.includes("未评估"));
+        assert(!/undefined|nan/i.test(missingMarkup));
+
+        const missingSimulationMarkup = renderSimulationExplanation({});
+        assert(missingSimulationMarkup.includes("无法比较"));
+        assert(missingSimulationMarkup.includes("稳健性样本不足或未提供"));
+        assert(!missingSimulationMarkup.includes("0.0%"));
+        assert(!missingSimulationMarkup.includes("4/4"));
+        assert(!/undefined|nan/i.test(missingSimulationMarkup));
+
+        const incompleteRobustnessMarkup = renderSimulationExplanation({
+          robustness: { status: "ok", direction_consistent_count: 4 },
+        });
+        assert(incompleteRobustnessMarkup.includes("稳健性样本不足或未提供"));
+        assert(!incompleteRobustnessMarkup.includes("4/4"));
+
+        const insufficientRobustnessMarkup = renderSimulationExplanation({
+          robustness: { status: "data_insufficient", direction_consistent_count: 4, direction_total: 4 },
+        });
+        assert(insufficientRobustnessMarkup.includes("稳健性样本不足或未提供"));
+        assert(!insufficientRobustnessMarkup.includes("4/4"));
+
+        function detailsContainer(markup) {
+          const container = { nodes: [], querySelectorAll: () => container.nodes };
+          Object.defineProperty(container, "innerHTML", {
+            get: () => container.markup,
+            set: (value) => {
+              container.markup = String(value || "");
+              const nodes = [];
+              const tags = /<details\\b([^>]*)>/g;
+              let match;
+              while ((match = tags.exec(container.markup)) !== null) {
+                const keyMatch = match[1].match(/data-detail-key="([^"]*)"/);
+                if (!keyMatch) continue;
+                nodes.push({
+                  dataset: { detailKey: keyMatch[1] },
+                  open: /\\bopen\\b/.test(match[1]),
+                });
+              }
+              container.nodes = nodes;
+            },
+          });
+          container.innerHTML = markup;
+          return container;
+        }
+
+        const firstResult = { code: "159922", asset_type: "etf", mode: "analyze" };
+        const otherResult = { code: "600000", asset_type: "stock", mode: "analyze" };
+        const firstKey = detailKey(firstResult, "analysis");
+        const otherKey = detailKey(otherResult, "analysis");
+        assert.notStrictEqual(firstKey, otherKey);
+        assert(!detailKey({ code: '<unsafe"text>' }, "analysis").includes("<"));
+        const detailContainer = detailsContainer(
+          `<details data-detail-key="${firstKey}" open></details><details data-detail-key="${otherKey}"></details>`
+        );
+        rerenderWithOpenDetails(
+          detailContainer,
+          () => `<details data-detail-key="${otherKey}"></details><details data-detail-key="${firstKey}"></details>`
+        );
+        const firstNode = detailContainer.nodes.find((node) => node.dataset.detailKey === firstKey);
+        const otherNode = detailContainer.nodes.find((node) => node.dataset.detailKey === otherKey);
+        assert(firstNode && firstNode.open);
+        assert(otherNode && !otherNode.open);
+        console.log("web helper runtime checks passed");
+        """
+    )
+    result = subprocess.run(
+        ["node", "-e", script, str(REPO_ROOT / "web" / "app.js")],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "web helper runtime checks passed" in result.stdout
+
+
+def test_detailed_analysis_and_backtest_explanations_are_rendered_without_nan() -> None:
+    for phrase in (
+        "主要依据",
+        "研究建议",
+        "查看完整分析过程与依据",
+        "低位观察三项条件",
+        "高位观察三项条件",
+        "实际指标",
+        "为什么不是低位",
+        "下一次重点观察",
+        "严格失效规则",
+        "not_a_trade_instruction",
+        "查看模拟过程与结论",
+        "为什么不能外推未来",
+        "safeDisplayValue",
+    ):
+        assert phrase in APP
+    assert 'id="simulation-detail"' in HTML
+    assert "4/4" not in APP
+    assert "Number.isFinite" in APP
+    assert 'data-detail-key="' in APP
+    assert 'querySelectorAll("details[data-detail-key]")' in APP
+    assert "undefined" in APP
+    assert "NaN" not in APP
 
 
 def test_mobile_layout_prevents_long_names_and_keeps_legacy_tools_collapsed() -> None:

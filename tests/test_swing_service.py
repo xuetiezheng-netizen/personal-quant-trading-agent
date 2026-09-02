@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -346,9 +347,113 @@ def test_analyze_writes_private_beginner_report_and_latest_contract(tmp_path: Pa
     assert latest["schema_version"] == 1
     assert latest["results"][0]["code"] == "999999"
     assert latest["results"][0]["report_path"] == result.report_path
+    latest_analysis = latest["results"][0]
+    for key in (
+        "state_label",
+        "confidence",
+        "strategy_version",
+        "adjustment",
+        "bars_available",
+        "required_bars",
+        "reasons",
+        "unused_information",
+        "features",
+        "analysis_explanation",
+        "generated_at",
+    ):
+        assert key in latest_analysis
+    for key in ("open", "high", "low", "volume", "ma_fast_slope", "atr", "bollinger_bandwidth", "bars_available"):
+        assert key in latest_analysis["features"]
+    assert "分析流程" in report
+    assert "为什么不是低位" in report
+    assert "研究动作建议" in report
+    assert "严格失效规则" in report
     assert not Path(latest["results"][0]["report_path"]).is_absolute()
     assert service.run_summary_path.is_file()
     assert load_latest_results(tmp_path)["results"]
+
+
+def test_analysis_report_uses_chinese_trend_labels(tmp_path: Path) -> None:
+    service = _service(tmp_path, _bars(150))
+
+    result = service.analyze("999999")
+    report = (tmp_path / result.report_path).read_text(encoding="utf-8")  # type: ignore[arg-type]
+
+    assert "趋势环境：" in report
+    for raw_label in ("趋势环境：up", "趋势环境：down", "趋势环境：sideways"):
+        assert raw_label not in report
+
+
+def test_failed_refresh_preserves_last_success_and_records_safe_attempt(tmp_path: Path) -> None:
+    service = _service(tmp_path, _bars(150))
+
+    first = service.analyze("999999")
+    assert first.status == "ok"
+    assert first.state is SwingState.NEUTRAL
+    assert first.data_as_of.isoformat() == "2025-05-30"
+    first_report = first.report_path
+    first_generated_at = json.loads(
+        service.latest_results_path.read_text(encoding="utf-8")
+    )["results"][0]["generated_at"]
+
+    service.provider = _FailingHistoryProvider(
+        "eastmoney", RuntimeError("private provider detail must not persist")
+    )
+    failed = service.analyze("999999")
+    assert failed.status == "error"
+
+    latest = json.loads(service.latest_results_path.read_text(encoding="utf-8"))
+    item = next(
+        result
+        for result in latest["results"]
+        if result["code"] == "999999" and result["mode"] == "analyze"
+    )
+    assert item["status"] == "ok"
+    assert item["state"] == SwingState.NEUTRAL.value
+    assert item["data_as_of"] == "2025-05-30"
+    assert item["generated_at"] == first_generated_at
+    assert item["report_path"] == first_report
+    assert item["last_update_attempt"]["status"] == "error"
+    assert item["last_update_attempt"]["generated_at"] == "2026-09-01T16:00:00+08:00"
+    assert "公开日线" in item["last_update_attempt"]["error"]
+    assert "private provider detail" not in repr(item)
+
+
+def test_failed_first_refresh_keeps_error_card_without_stale_success_marker(tmp_path: Path) -> None:
+    service = _service(
+        tmp_path,
+        _bars(150),
+        provider=_FailingHistoryProvider("eastmoney", RuntimeError("temporary failure")),
+    )
+
+    result = service.analyze("999999")
+
+    assert result.status == "error"
+    latest = json.loads(service.latest_results_path.read_text(encoding="utf-8"))
+    item = next(item for item in latest["results"] if item["mode"] == "analyze")
+    assert item["status"] == "error"
+    assert "last_update_attempt" not in item
+    assert item["data_as_of"] is None
+
+
+def test_zero_volume_history_is_not_directionally_analysed(tmp_path: Path) -> None:
+    bars = tuple(replace(bar, volume=0.0) for bar in _bars(150))
+    history = _history_data("adata", bars)
+    service = _service(
+        tmp_path,
+        bars,
+        provider=_FixedHistoryProvider("adata", history),
+    )
+
+    result = service.analyze("999999")
+
+    assert result.status == "data_insufficient"
+    assert result.state is SwingState.DATA_INSUFFICIENT
+    assert result.data_source == "adata"
+    assert result.data_as_of.isoformat() == "2025-05-30"
+    assert result.features["relative_volume"] is None
+    assert result.analysis_explanation["low_watch"]["evaluated"] is False
+    assert result.analysis_explanation["high_watch"]["evaluated"] is False
 
 
 def test_backtest_reports_assumptions_and_preserves_core_boundary(tmp_path: Path) -> None:
@@ -391,6 +496,7 @@ def test_backtest_reports_assumptions_and_preserves_core_boundary(tmp_path: Path
     assert "收盘口径" in report
     assert "固定敏感性检查" in report
     assert "不能证明未来有效" in report
+    assert "模拟过程与结论" in report
     assert "不是用户真实收益" in report
     assert "买入" not in report
     assert "卖出" not in report

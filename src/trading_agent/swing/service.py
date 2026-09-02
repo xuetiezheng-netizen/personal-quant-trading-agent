@@ -37,7 +37,7 @@ from trading_agent.swing.models import (
     TransactionCosts,
 )
 from trading_agent.swing.portfolio import Holding, PortfolioSnapshot, PortfolioStore
-from trading_agent.swing.strategy import SwingStateMachine
+from trading_agent.swing.strategy import SwingStateMachine, build_analysis_explanation
 from trading_agent.swing.validation import run_robustness_checks
 
 STRATEGY_VERSION = "swing-low-frequency-v1.1"
@@ -168,10 +168,13 @@ class AnalysisResult:
     error: str | None = None
     report_path: str | None = None
     source_attempts: SourceAttempts = ()
+    analysis_explanation: Mapping[str, object] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.features is None:
             object.__setattr__(self, "features", {})
+        if self.analysis_explanation is None:
+            object.__setattr__(self, "analysis_explanation", {})
 
     @property
     def is_data_sufficient(self) -> bool:
@@ -196,6 +199,7 @@ class AnalysisResult:
             "reasons": list(self.reasons),
             "unused_information": list(self.unused_information),
             "features": dict(self.features),
+            "analysis_explanation": dict(self.analysis_explanation),
             "report_path": self.report_path,
             "source_attempts": _source_attempts_payload(self.source_attempts),
         }
@@ -566,23 +570,69 @@ def _feature_dict(decision: SwingDecision | None) -> dict[str, object]:
         return round(value, 4) if value is not None and math.isfinite(value) else None
 
     return {
+        "open": rounded(features.open_price),
+        "high": rounded(features.high_price),
+        "low": rounded(features.low_price),
         "close_price": rounded(features.close_price),
+        "volume": rounded(features.volume),
         "price_position": rounded(features.price_position),
         "drawdown": rounded(features.drawdown),
         "ma_fast": rounded(features.ma_fast),
         "ma_slow": rounded(features.ma_slow),
+        "ma_fast_slope": rounded(features.ma_fast_slope),
         "rsi": rounded(features.rsi),
+        "atr": rounded(features.atr),
         "atr_pct": rounded(features.atr_pct),
         "bollinger_percent_b": rounded(features.bollinger_percent_b),
+        "bollinger_bandwidth": rounded(features.bollinger_bandwidth),
         "relative_volume": rounded(features.relative_volume),
         "trend_regime": features.trend_regime,
         "candle_patterns": [_PATTERN_LABELS.get(name, name) for name in features.candle_patterns],
+        "bars_available": features.bars_available,
     }
 
 
 def _generic_data_error() -> str:
     # 不回显 provider 原始异常，避免把绝对路径、请求参数或个人内容写进错误。
     return "公开日线暂时不可用或未通过完整性校验，未生成方向状态或历史收益结论。"
+
+
+def _last_update_attempt(
+    result: AnalysisResult | BacktestReport,
+    generated_at: datetime,
+) -> dict[str, object]:
+    """Build the safe marker for a failed refresh of an older good result."""
+
+    return {
+        "status": "error",
+        "generated_at": generated_at.isoformat(timespec="seconds"),
+        "error": _generic_data_error(),
+        "source_attempts": _source_attempts_payload(
+            getattr(result, "source_attempts", ())
+        ),
+    }
+
+
+def _normalise_last_update_attempt(
+    value: object,
+    *,
+    fallback_generated_at: object,
+) -> dict[str, object] | None:
+    """Keep only the public, safe fields of a legacy stale-result marker."""
+
+    if not isinstance(value, Mapping):
+        return None
+    generated_at = value.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at.strip():
+        generated_at = fallback_generated_at
+    if not isinstance(generated_at, str) or not generated_at.strip():
+        return None
+    return {
+        "status": "error",
+        "generated_at": generated_at.strip(),
+        "error": _generic_data_error(),
+        "source_attempts": _source_attempts_payload(value.get("source_attempts", ())),
+    }
 
 
 class SwingService:
@@ -724,7 +774,7 @@ class SwingService:
             for item_mode in modes:
                 if item_mode == "analyze":
                     item = self._analyze_holding(holding, observed_at)
-                    report_text = self._render_analysis(item)
+                    report_text = self._render_analysis(item, generated_at=generated_at)
                     report_kind = "analysis"
                 else:
                     item = self._backtest_holding(holding, observed_at)
@@ -798,12 +848,16 @@ class SwingService:
                 raise SwingDataInsufficientError("empty")
             data_as_of = history.bars[-1].trade_date.date()
             bars_available = len(history.bars)
-            if bars_available < self.config.min_history_bars:
+            if (
+                bars_available < self.config.min_history_bars
+                or decision.state is SwingState.DATA_INSUFFICIENT
+                or not decision.features.is_complete
+            ):
                 state = SwingState.DATA_INSUFFICIENT
                 state_label = _STATE_LABELS[state]
                 status = "data_insufficient"
                 confidence = "较低"
-                reasons = ("历史日线数量少于最低要求，暂不生成方向状态",)
+                reasons = ("历史日线数量不足或指标未完整计算，暂不生成方向状态",)
             else:
                 state = decision.state
                 state_label = _STATE_LABELS[state]
@@ -812,6 +866,16 @@ class SwingService:
                     decision.confidence, decision.confidence
                 )
                 reasons = _translate_reasons(decision)
+            previous = features[-2] if len(features) > 1 else None
+            previous_state = decisions[-2].state if len(decisions) > 1 else None
+            explanation = build_analysis_explanation(
+                features[-1] if features else None,
+                decision=decision,
+                previous=previous,
+                previous_state=previous_state,
+                config=self.config,
+                enough_history=status == "ok",
+            )
             return AnalysisResult(
                 code=holding.code,
                 name=holding.name,
@@ -829,6 +893,7 @@ class SwingService:
                 adjustment=history.adjustment,
                 reasons=reasons,
                 features=_feature_dict(decision),
+                analysis_explanation=explanation,
                 source_attempts=history.source_attempts,
             )
         except Exception as exc:  # noqa: BLE001 - safe public result boundary
@@ -850,6 +915,11 @@ class SwingService:
                     data_source=_safe_data_source(getattr(self.provider, "name", "public_daily")),
                     adjustment="qfq",
                     reasons=("没有可用的完整收盘日线",),
+                    analysis_explanation=build_analysis_explanation(
+                        None,
+                        config=self.config,
+                        enough_history=False,
+                    ),
                     error=_generic_data_error(),
                     source_attempts=failure_attempts,
                 )
@@ -869,6 +939,11 @@ class SwingService:
                 data_source=_safe_data_source(getattr(self.provider, "name", "public_daily")),
                 adjustment="qfq",
                 reasons=("公开日线未通过安全校验",),
+                analysis_explanation=build_analysis_explanation(
+                    None,
+                    config=self.config,
+                    enough_history=False,
+                ),
                 error=_generic_data_error(),
                 source_attempts=failure_attempts,
             )
@@ -964,10 +1039,10 @@ class SwingService:
                 source_attempts=_attempts_from_failure(exc),
             )
 
-    def _render_analysis(self, result: AnalysisResult) -> str:
+    def _render_analysis(self, result: AnalysisResult, *, generated_at: datetime | None = None) -> str:
         from trading_agent.swing.reports import render_analysis_report
 
-        return render_analysis_report(result)
+        return render_analysis_report(result, generated_at=generated_at)
 
     def _render_backtest(self, result: BacktestReport) -> str:
         from trading_agent.swing.reports import render_backtest_report
@@ -1018,9 +1093,23 @@ class SwingService:
                             "mode": mode,
                             "status": item.get("status", "unknown"),
                             "state": item.get("state", "DATA_INSUFFICIENT"),
+                            "state_label": item.get("state_label"),
+                            "confidence": item.get("confidence"),
+                            "strategy_version": item.get("strategy_version"),
+                            "as_of": item.get("as_of"),
                             "data_as_of": item.get("data_as_of"),
+                            "start_date": item.get("start_date"),
+                            "end_date": item.get("end_date"),
+                            "bars_available": item.get("bars_available", 0),
+                            "required_bars": item.get("required_bars"),
                             "report_path": self._safe_report_reference(item.get("report_path")),
                             "data_source": _safe_data_source(item.get("data_source")),
+                            "adjustment": item.get("adjustment", "qfq"),
+                            "reasons": item.get("reasons", []),
+                            "unused_information": item.get("unused_information", []),
+                            "features": item.get("features", {}),
+                            "analysis_explanation": item.get("analysis_explanation", {}),
+                            "generated_at": item.get("generated_at", current.get("updated_at")),
                             "source_attempts": _source_attempts_payload(
                                 item.get("source_attempts", ())
                             ),
@@ -1037,6 +1126,12 @@ class SwingService:
                             ):
                                 if summary_key in item:
                                     entry[summary_key] = item.get(summary_key)
+                        previous_attempt = _normalise_last_update_attempt(
+                            item.get("last_update_attempt"),
+                            fallback_generated_at=current.get("updated_at"),
+                        )
+                        if previous_attempt is not None:
+                            entry["last_update_attempt"] = previous_attempt
                         if isinstance(item.get("error"), str):
                             entry["error"] = "最近运行存在数据边界，请重新运行查看。"
                         merged[(code, asset_type, mode)] = entry
@@ -1051,9 +1146,23 @@ class SwingService:
                     "mode",
                     "status",
                     "state",
+                    "state_label",
+                    "confidence",
+                    "strategy_version",
+                    "as_of",
                     "data_source",
                     "data_as_of",
+                    "start_date",
+                    "end_date",
+                    "bars_available",
+                    "required_bars",
+                    "adjustment",
+                    "reasons",
+                    "unused_information",
+                    "features",
+                    "analysis_explanation",
                     "report_path",
+                    "generated_at",
                     "error",
                     "assumptions",
                     "buy_and_hold",
@@ -1062,6 +1171,7 @@ class SwingService:
                     "trade_events",
                     "deferred_count",
                     "robustness",
+                    "last_update_attempt",
                     "source_attempts",
                 )
                 if key in payload
@@ -1070,7 +1180,20 @@ class SwingService:
                 payload.get("source_attempts", ())
             )
             payload["data_source"] = _safe_data_source(payload.get("data_source"))
-            merged[(str(payload["code"]), str(payload["asset_type"]), str(payload["mode"]))] = payload
+            payload["generated_at"] = generated_at.isoformat(timespec="seconds")
+            key = (str(payload["code"]), str(payload["asset_type"]), str(payload["mode"]))
+            previous = merged.get(key)
+            if previous is not None and previous.get("status") == "ok" and payload.get("status") != "ok":
+                # Keep the last good analysis body/report visible. The current
+                # failure is attached as an attempt, never masqueraded as a
+                # newly generated conclusion.
+                preserved = dict(previous)
+                preserved["last_update_attempt"] = _last_update_attempt(item, generated_at)
+                merged[key] = preserved
+            else:
+                # A successful refresh supersedes any earlier stale marker.
+                payload.pop("last_update_attempt", None)
+                merged[key] = payload
         document = {
             "schema_version": 1,
             "updated_at": generated_at.isoformat(timespec="seconds"),

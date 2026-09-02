@@ -132,6 +132,11 @@ def _print_run(run: SwingRun) -> None:
     for item in run.results:
         counts[item.status] = counts.get(item.status, 0) + 1
     print("结果状态：" + "、".join(f"{key} {value} 项" for key, value in sorted(counts.items())))
+    for item in run.results:
+        if item.status == "ok":
+            print(f"- {item.code}：本次结果成功。")
+        else:
+            print(f"- {item.code}：本次结果失败；若有上次成功结果，最新摘要会保留旧结果并标注本次失败。")
     print("报告已保存到本机私有目录 data/private/reports。")
 
 
@@ -160,6 +165,8 @@ def main(
             as_of=args.as_of,
         )
         _print_run(run)
+        if run.results and not any(item.status == "ok" for item in run.results):
+            return 2
         return 0
     except (RuntimeError, OSError, ValueError):
         # 不打印异常对象：provider/路径错误可能包含请求、绝对路径或个人字段。

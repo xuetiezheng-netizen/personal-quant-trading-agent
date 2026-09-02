@@ -20,12 +20,17 @@ from trading_agent.swing.models import (
     TransactionCosts,
 )
 from trading_agent.swing.strategy import (
+    HIGH_BOLLINGER_PERCENT_B_THRESHOLD,
+    LOW_BOLLINGER_PERCENT_B_THRESHOLD,
     SwingStateMachine,
+    build_analysis_explanation,
     evaluate_swing_series,
     evaluate_swing_state,
 )
 
 __all__ = [
+    "HIGH_BOLLINGER_PERCENT_B_THRESHOLD",
+    "LOW_BOLLINGER_PERCENT_B_THRESHOLD",
     "AssetType",
     "BacktestResult",
     "EquityPoint",
@@ -38,6 +43,7 @@ __all__ = [
     "TradeEvent",
     "TransactionCosts",
     "backtest",
+    "build_analysis_explanation",
     "calculate_swing_features",
     "compute_features",
     "evaluate_swing_series",

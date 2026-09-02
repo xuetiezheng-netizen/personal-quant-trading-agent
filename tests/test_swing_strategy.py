@@ -5,7 +5,13 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from trading_agent.swing.models import SwingConfig, SwingFeatures, SwingState
-from trading_agent.swing.strategy import SwingStateMachine, evaluate_swing_state
+from trading_agent.swing.strategy import (
+    HIGH_BOLLINGER_PERCENT_B_THRESHOLD,
+    LOW_BOLLINGER_PERCENT_B_THRESHOLD,
+    SwingStateMachine,
+    build_analysis_explanation,
+    evaluate_swing_state,
+)
 
 
 def _feature(
@@ -409,9 +415,213 @@ def test_state_machine_requires_enough_history_and_strict_date_order(strategy_co
         machine.update(_feature(0))
 
 
+def test_explanation_cannot_override_history_contract_with_explicit_enough_history(strategy_config) -> None:
+    low = _feature(
+        0,
+        position=0.10,
+        drawdown=-0.30,
+        rsi=25.0,
+        bb=0.10,
+        patterns=("hammer",),
+        bars_available=119,
+    )
+    decision = evaluate_swing_state(low, config=strategy_config)
+
+    explanation = build_analysis_explanation(
+        low,
+        decision=decision,
+        config=strategy_config,
+        enough_history=True,
+    )
+
+    assert decision.state is SwingState.DATA_INSUFFICIENT
+    assert explanation["low_watch"]["evaluated"] is False
+    assert explanation["high_watch"]["evaluated"] is False
+    assert explanation["low_watch"]["conditions"] == []
+    assert explanation["conclusion"]["state"] == SwingState.DATA_INSUFFICIENT.value
+
+
 def test_state_machine_series_resets_between_runs(strategy_config) -> None:
     machine = SwingStateMachine(strategy_config)
     first = machine.evaluate([_feature(0), _feature(1)])
     second = machine.evaluate([_feature(0), _feature(1)])
 
     assert first == second
+
+
+def test_analysis_explanation_exposes_three_conditions_and_single_threshold_source(strategy_config) -> None:
+    low = _feature(
+        0,
+        close=90.0,
+        position=0.10,
+        drawdown=-0.30,
+        rsi=25.0,
+        bb=0.10,
+        patterns=("hammer",),
+    )
+    low_decision = evaluate_swing_state(low, config=strategy_config)
+    low_explanation = build_analysis_explanation(
+        low,
+        decision=low_decision,
+        config=strategy_config,
+        enough_history=True,
+    )
+    assert low_explanation["low_watch"]["pass"] is True
+    assert len(low_explanation["low_watch"]["conditions"]) == 3
+    assert low_explanation["low_watch"]["conditions"][2]["threshold"]["bollinger_percent_b"]["value"] == LOW_BOLLINGER_PERCENT_B_THRESHOLD
+
+    high = _feature(
+        1,
+        close=110.0,
+        position=0.90,
+        drawdown=-0.01,
+        rsi=75.0,
+        bb=0.90,
+        patterns=("shooting_star",),
+    )
+    high_decision = evaluate_swing_state(high, config=strategy_config)
+    high_explanation = build_analysis_explanation(
+        high,
+        decision=high_decision,
+        config=strategy_config,
+        enough_history=True,
+    )
+    assert high_explanation["high_watch"]["pass"] is True
+    assert len(high_explanation["high_watch"]["conditions"]) == 3
+    assert high_explanation["high_watch"]["conditions"][2]["threshold"]["bollinger_percent_b"]["value"] == HIGH_BOLLINGER_PERCENT_B_THRESHOLD
+
+
+def test_neutral_explanation_says_why_not_low_or_high_and_handles_missing_indicators(strategy_config) -> None:
+    neutral = _feature(0, position=0.5, drawdown=-0.03)
+    decision = evaluate_swing_state(neutral, config=strategy_config)
+    explanation = build_analysis_explanation(
+        neutral,
+        decision=decision,
+        config=strategy_config,
+        enough_history=True,
+    )
+    conclusion = explanation["conclusion"]
+    assert decision.state is SwingState.NEUTRAL
+    assert "低位" in conclusion["why_not_low"]
+    assert "高位" in conclusion["why_not_high"]
+    missing = _feature(1, position=0.5, drawdown=-0.03, rsi=None, bb=None)
+    missing_decision = evaluate_swing_state(missing, config=strategy_config)
+    missing_explanation = build_analysis_explanation(
+        missing,
+        decision=missing_decision,
+        config=strategy_config,
+        enough_history=False,
+    )
+    assert missing_explanation["low_watch"]["evaluated"] is False
+    assert missing_explanation["high_watch"]["evaluated"] is False
+    assert missing_explanation["low_watch"]["conditions"] == []
+    assert "有效收盘日线不足" in missing_explanation["conclusion"]["why"]
+    assert explanation["model_boundary"]["strict_invalidation_rule"]
+
+
+def test_confirmation_explanation_contains_numeric_rsi_chain_and_localised_patterns(strategy_config) -> None:
+    previous = _feature(
+        0,
+        close=90.0,
+        position=0.10,
+        drawdown=-0.30,
+        rsi=25.0,
+        bb=0.10,
+        patterns=("hammer",),
+    )
+    current = _feature(
+        1,
+        close=92.0,
+        position=0.12,
+        drawdown=-0.29,
+        rsi=27.0,
+        bb=0.15,
+    )
+    watch = evaluate_swing_state(previous, config=strategy_config)
+    decision = evaluate_swing_state(
+        current,
+        previous=previous,
+        previous_state=watch.state,
+        config=strategy_config,
+    )
+    explanation = build_analysis_explanation(
+        current,
+        decision=decision,
+        previous=previous,
+        previous_state=watch.state,
+        config=strategy_config,
+        enough_history=True,
+    )
+
+    route = explanation["confirmation_path"]["bottom"]["routes"][1]
+    chain = route["actual"]["rsi_chain"]
+    assert chain["current_rsi"] == 27.0
+    assert chain["previous_rsi"] == 25.0
+    assert chain["required_current_rsi"] == 26.0
+    assert "当前RSI 27.0 > 前一日RSI 25.0 + 1.0 = 26.0" in chain["comparison"]
+    assert route["threshold"]["rsi"]["formula"] == "当前RSI > 前一日RSI + 1.0"
+    assert explanation["confirmation_path"]["bottom"]["routes"][0]["actual"]["previous_patterns"] == ["锤子线"]
+    assert "hammer" not in repr(explanation)
+
+    high_previous = _feature(
+        2,
+        close=110.0,
+        position=0.90,
+        drawdown=-0.01,
+        rsi=75.0,
+        bb=0.90,
+        patterns=("shooting_star",),
+    )
+    high_current = _feature(
+        3,
+        close=108.0,
+        position=0.88,
+        drawdown=-0.02,
+        rsi=73.0,
+        bb=0.85,
+    )
+    high_watch = evaluate_swing_state(high_previous, config=strategy_config)
+    high_decision = evaluate_swing_state(
+        high_current,
+        previous=high_previous,
+        previous_state=high_watch.state,
+        config=strategy_config,
+    )
+    high_explanation = build_analysis_explanation(
+        high_current,
+        decision=high_decision,
+        previous=high_previous,
+        previous_state=high_watch.state,
+        config=strategy_config,
+        enough_history=True,
+    )
+    high_route = high_explanation["confirmation_path"]["top"]["routes"][1]
+    high_chain = high_route["actual"]["rsi_chain"]
+    assert high_chain["required_current_rsi"] == 74.0
+    assert "当前RSI 73.0 < 前一日RSI 75.0 - 1.0 = 74.0" in high_chain["comparison"]
+    assert high_route["threshold"]["rsi"]["formula"] == "当前RSI < 前一日RSI - 1.0"
+    assert high_explanation["confirmation_path"]["top"]["routes"][0]["actual"]["previous_patterns"] == ["射击之星形态"]
+
+
+def test_insufficient_explanation_short_circuits_directional_conditions(strategy_config) -> None:
+    partial = _feature(
+        0,
+        position=0.1,
+        drawdown=-0.3,
+        rsi=25.0,
+        bb=0.1,
+        bars_available=119,
+    )
+    decision = evaluate_swing_state(partial, config=strategy_config)
+    explanation = build_analysis_explanation(
+        partial,
+        decision=decision,
+        config=strategy_config,
+        enough_history=False,
+    )
+
+    assert explanation["current_state"]["value"] == SwingState.DATA_INSUFFICIENT.value
+    assert explanation["low_watch"]["evaluated"] is False
+    assert explanation["high_watch"]["evaluated"] is False
+    assert explanation["confirmation_path"]["evaluated"] is False
+    assert "低位条件已满足" not in repr(explanation)

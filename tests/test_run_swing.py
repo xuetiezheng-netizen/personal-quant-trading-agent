@@ -36,6 +36,13 @@ class FakeProvider:
         return _bars()
 
 
+class ErrorProvider:
+    name = "eastmoney"
+
+    def fetch_daily_bars(self, code: str, *, asset_type: str, as_of: object = None):
+        raise RuntimeError("synthetic public data failure")
+
+
 def _service(tmp_path: Path) -> SwingService:
     store = PortfolioStore(tmp_path / "data" / "private" / "holdings.json")
     store.add_holding(
@@ -80,6 +87,25 @@ def test_cli_all_uses_private_relative_output_and_no_error_path(
     assert str(tmp_path) not in captured.err
     assert str(tmp_path) not in captured.out
     assert service.latest_results_path.is_file()
+
+
+def test_cli_all_failures_returns_nonzero_and_prints_per_result_failure(
+    tmp_path: Path, capsys
+) -> None:
+    from scripts import run_swing
+
+    service = _service(tmp_path)
+    service.provider = ErrorProvider()
+    exit_code = run_swing.main(
+        ["analyze", "--repo-root", str(tmp_path)],
+        service_factory=lambda _root: service,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code != 0
+    assert "结果状态：error 1 项" in captured.out
+    assert "本次结果失败" in captured.out
+    assert "持仓波段运行失败" not in captured.err
 
 
 def test_cli_failure_is_generic_and_does_not_echo_personal_path(tmp_path: Path, capsys) -> None:
